@@ -396,52 +396,86 @@ jobs:
           # between this `@@@` and the next `@@@`.
           if [ -n "$PATCHES" ]; then
             APPLIED=0
-            # Use awk to walk the patch block and emit patch records with
-            # proper path/body separation using ASCII 034 (file separator).
+            # Use awk to walk the patch block line-by-line and properly parse
+            # the @@@-delimited records. State machine: path -> body -> path...
             PATCH_QUEUE=$(mktemp)
-            PATCH_MARKER=$'\034'
             
-            printf '%s' "$PATCHES" | awk -v marker="$PATCH_MARKER" '
-              BEGIN { state = "path"; path = ""; body = ""; }
+            printf '%s\n' "$PATCHES" | awk '
+              BEGIN { 
+                state = "path"
+                path = ""
+                body = ""
+              }
               /^@@@$/ {
                 if (state == "body") {
-                  printf "%s%s%s\n", path, marker, body > "'"$PATCH_QUEUE"'"
-                  state = "path"; path = ""; body = ""; next
+                  # End of body: output the complete record
+                  printf "%s\n", path > "'"$PATCH_QUEUE"'"
+                  printf "%s\n", body > "'"$PATCH_QUEUE"'"
+                  printf "RECORD_SEPARATOR\n" > "'"$PATCH_QUEUE"'"
+                  state = "path"
+                  path = ""
+                  body = ""
+                  next
                 }
-                if (state == "path") { state = "body"; next }
+                if (state == "path") {
+                  # Transition to body
+                  state = "body"
+                  next
+                }
               }
-              state == "path" { path = (path == "" ? $0 : path "\n" $0) }
-              state == "body" { body = (body == "" ? $0 : body "\n" $0) }
-              END {
-                if (state == "body" && path != "") {
-                  printf "%s%s%s\n", path, marker, body > "'"$PATCH_QUEUE"'"
-                }
+              state == "path" {
+                # Accumulate path lines
+                path = (path == "" ? $0 : path "\n" $0)
+                next
+              }
+              state == "body" {
+                # Accumulate body lines
+                body = (body == "" ? $0 : body "\n" $0)
+                next
               }
             '
-
-            while IFS="$PATCH_MARKER" read -r PFILE PBODY; do
-              [ -z "$PFILE" ] && continue
-              
-              # Trim whitespace from PFILE
-              PFILE=$(printf '%s' "$PFILE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-              
-              # Security: refuse paths that escape the repo or are absolute.
-              if printf '%s' "$PFILE" | grep -qE '^/|/\.\./|\.\./|/\.\.$'; then
-                echo "::error::refusing unsafe patch path: $PFILE"
-                exit 1
+            
+            # Read patch records from PATCH_QUEUE (path, then body, then separator)
+            CURRENT_PATH=""
+            CURRENT_BODY=""
+            while IFS= read -r line; do
+              if [ "$line" = "RECORD_SEPARATOR" ]; then
+                # Process the accumulated patch
+                if [ -n "$CURRENT_PATH" ]; then
+                  # Trim whitespace
+                  CURRENT_PATH=$(printf '%s' "$CURRENT_PATH" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                  
+                  # Security: refuse paths that escape the repo or are absolute.
+                  if printf '%s' "$CURRENT_PATH" | grep -qE '^/|/\.\./|\.\./|/\.\.$'; then
+                    echo "::error::refusing unsafe patch path: $CURRENT_PATH"
+                    exit 1
+                  fi
+                  
+                  # Validate path format (alphanumeric, dots, slashes, hyphens, underscores)
+                  if ! printf '%s' "$CURRENT_PATH" | grep -qE '^[a-zA-Z0-9._/-]+$'; then
+                    echo "::warning::skipping suspicious patch path: $CURRENT_PATH"
+                    CURRENT_PATH=""
+                    CURRENT_BODY=""
+                    continue
+                  fi
+                  
+                  # Write the file
+                  mkdir -p "$(dirname "$CURRENT_PATH")"
+                  printf '%s\n' "$CURRENT_BODY" > "$CURRENT_PATH"
+                  APPLIED=$((APPLIED+1))
+                  echo "✓ Patched $CURRENT_PATH"
+                fi
+                CURRENT_PATH=""
+                CURRENT_BODY=""
+              elif [ -z "$CURRENT_PATH" ]; then
+                # First line after separator (or start) is the path
+                CURRENT_PATH="$line"
+              else
+                # All subsequent lines until RECORD_SEPARATOR are body
+                CURRENT_BODY="$(printf '%s\n%s' "$CURRENT_BODY" "$line")"
               fi
-              
-              # Additional validation: ensure path looks like a real file path
-              if ! printf '%s' "$PFILE" | grep -qE '^[a-zA-Z0-9._/-]+$'; then
-                echo "::warning::skipping suspicious patch path: $PFILE"
-                continue
-              fi
-              
-              mkdir -p "$(dirname "$PFILE")"
-              printf '%s\n' "$PBODY" > "$PFILE"
-              APPLIED=$((APPLIED+1))
-              echo "✓ Patched $PFILE"
             done < "$PATCH_QUEUE"
+            
             echo "Applied $APPLIED file(s)."
           else
             echo "ℹ No patches emitted by NVIDIA (empty patch block)."
