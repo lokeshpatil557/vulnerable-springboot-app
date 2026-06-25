@@ -419,9 +419,11 @@ jobs:
             while IFS=$(printf '\t') read -r PFILE PBODY; do
               [ -z "$PFILE" ] && continue
               # Security: refuse paths that escape the repo or are absolute.
-              case "$PFILE" in
-                /*|..*|*/../*|*/..) echo "::error::refusing unsafe patch path: $PFILE"; exit 1;;
-              esac
+              # Path validation: must not start with /, contain .., or end with /..
+              if printf '%s' "$PFILE" | grep -qE '^/|/\.\./|\.\./|/\.\.$'; then
+                echo "::error::refusing unsafe patch path: $PFILE"
+                exit 1
+              fi
               mkdir -p "$(dirname "$PFILE")"
               printf '%s\n' "$PBODY" > "$PFILE"
               APPLIED=$((APPLIED+1))
