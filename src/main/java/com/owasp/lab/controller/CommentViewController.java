@@ -7,12 +7,12 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.apache.commons.text.StringEscapeUtils;
 
 import java.util.List;
 
 /**
- * Renders comments as raw HTML so the stored XSS payload fires in the
- * browser. DO NOT use this pattern in real applications.
+ * Renders comments as HTML with proper escaping to prevent XSS.
  */
 @RestController
 @RequestMapping("/comments")
@@ -24,19 +24,19 @@ public class CommentViewController {
         this.commentService = commentService;
     }
 
-    // VULNERABILITY (OWASP A03:2021 - Injection / XSS - Stored):
-    // All comments are concatenated into the HTML response without
-    // escaping. A malicious comment body will execute in the browser.
+    // FIXED: XSS - Stored - Now escaping HTML entities
     @GetMapping(produces = MediaType.TEXT_HTML_VALUE)
     public String viewAll() {
         StringBuilder sb = new StringBuilder();
         sb.append("<html><body><h1>Comments</h1>");
         List<Comment> comments = commentService.findAll();
         for (Comment c : comments) {
-            // VULNERABILITY: raw concatenation, no escaping.
+            // FIX: Escape HTML entities to prevent XSS
+            String escapedAuthor = StringEscapeUtils.escapeHtml4(c.getAuthor());
+            String escapedBody = StringEscapeUtils.escapeHtml4(c.getBody());
             sb.append("<div class='comment'>")
-              .append("<b>").append(c.getAuthor()).append(":</b> ")
-              .append(c.getBody())
+              .append("<b>").append(escapedAuthor).append(":</b> ")
+              .append(escapedBody)
               .append("</div>");
         }
         sb.append("</body></html>");
@@ -49,8 +49,10 @@ public class CommentViewController {
         if (c == null) {
             return "<html><body>Not found</body></html>";
         }
-        // VULNERABILITY: raw concatenation, no escaping.
+        // FIX: Escape HTML entities to prevent XSS
+        String escapedAuthor = StringEscapeUtils.escapeHtml4(c.getAuthor());
+        String escapedBody = StringEscapeUtils.escapeHtml4(c.getBody());
         return "<html><body><h1>Comment</h1><div><b>"
-                + c.getAuthor() + ":</b> " + c.getBody() + "</div></body></html>";
+                + escapedAuthor + ":</b> " + escapedBody + "</div></body></html>";
     }
 }

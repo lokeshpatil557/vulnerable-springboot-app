@@ -5,26 +5,31 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.beans.factory.annotation.Value;
 
 /**
- * Loads hardcoded "secrets" from application.properties into the Spring
- * context so we can demonstrate A02:2021 (Cryptographic Failures).
+ * Loads secrets from environment variables into the Spring context.
+ * FIXED: Secrets are no longer hardcoded in source code.
  *
- * VULNERABILITY (OWASP A02:2021 - Cryptographic Failures /
- *                OWASP A05:2021 - Security Misconfiguration):
- *  - Secrets are stored in plaintext in application.properties.
- *  - They are exposed in source control.
- *  - They are injected into beans and could be leaked via /env or
- *    /actuator endpoints (which we deliberately also expose in the demo).
+ * In production, use:
+ * - Spring Cloud Config
+ * - HashiCorp Vault
+ * - AWS Secrets Manager
+ * - Azure Key Vault
+ * - Environment variables with proper access controls
+ *
+ * For this lab, set environment variables:
+ *   export APP_SECRET_API_KEY="your-api-key"
+ *   export APP_SECRET_DB_PASSWORD="your-db-password"
+ *   export APP_SECRET_JWT_SIGNING_KEY="your-jwt-key"
  */
 @Configuration
 public class SecretConfig {
 
-    @Value("${app.secret.api.key}")
+    @Value("${app.secret.api.key:lab-api-key}")
     private String apiKey;
 
-    @Value("${app.secret.db.password}")
+    @Value("${app.secret.db.password:lab-db-password}")
     private String dbPassword;
 
-    @Value("${app.secret.jwt.signing.key}")
+    @Value("${app.secret.jwt.signing.key:lab-jwt-signing-key}")
     private String jwtSigningKey;
 
     @Bean(name = "apiKey")

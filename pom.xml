@@ -54,6 +54,13 @@
             <scope>runtime</scope>
         </dependency>
 
+        <!-- Apache Commons Text for HTML escaping -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-text</artifactId>
+            <version>1.11.0</version>
+        </dependency>
+
         <!-- Lombok (optional) -->
         <dependency>
             <groupId>org.projectlombok</groupId>
