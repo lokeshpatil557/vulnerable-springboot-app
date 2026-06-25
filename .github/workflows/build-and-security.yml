@@ -396,14 +396,16 @@ jobs:
           # between this `@@@` and the next `@@@`.
           if [ -n "$PATCHES" ]; then
             APPLIED=0
-            # Use awk to walk the patch block and emit one
-            # (path)\t(body-to-heredoc) record per file.
+            # Use awk to walk the patch block and emit patch records with
+            # proper path/body separation using ASCII 034 (file separator).
             PATCH_QUEUE=$(mktemp)
-            printf '%s' "$PATCHES" | awk '
+            PATCH_MARKER=$'\034'
+            
+            printf '%s' "$PATCHES" | awk -v marker="$PATCH_MARKER" '
               BEGIN { state = "path"; path = ""; body = ""; }
               /^@@@$/ {
                 if (state == "body") {
-                  printf "%s\t%s\n", path, body > "'"$PATCH_QUEUE"'"
+                  printf "%s%s%s\n", path, marker, body > "'"$PATCH_QUEUE"'"
                   state = "path"; path = ""; body = ""; next
                 }
                 if (state == "path") { state = "body"; next }
@@ -412,18 +414,29 @@ jobs:
               state == "body" { body = (body == "" ? $0 : body "\n" $0) }
               END {
                 if (state == "body" && path != "") {
-                  printf "%s\t%s\n", path, body > "'"$PATCH_QUEUE"'"
+                  printf "%s%s%s\n", path, marker, body > "'"$PATCH_QUEUE"'"
                 }
               }
             '
-            while IFS=$(printf '\t') read -r PFILE PBODY; do
+
+            while IFS="$PATCH_MARKER" read -r PFILE PBODY; do
               [ -z "$PFILE" ] && continue
+              
+              # Trim whitespace from PFILE
+              PFILE=$(printf '%s' "$PFILE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+              
               # Security: refuse paths that escape the repo or are absolute.
-              # Path validation: must not start with /, contain .., or end with /..
               if printf '%s' "$PFILE" | grep -qE '^/|/\.\./|\.\./|/\.\.$'; then
                 echo "::error::refusing unsafe patch path: $PFILE"
                 exit 1
               fi
+              
+              # Additional validation: ensure path looks like a real file path
+              if ! printf '%s' "$PFILE" | grep -qE '^[a-zA-Z0-9._/-]+$'; then
+                echo "::warning::skipping suspicious patch path: $PFILE"
+                continue
+              fi
+              
               mkdir -p "$(dirname "$PFILE")"
               printf '%s\n' "$PBODY" > "$PFILE"
               APPLIED=$((APPLIED+1))
