@@ -20,8 +20,8 @@ import java.util.List;
  *  - /api/search continues to use parameterised SQL (see UserService)
  *    and is restricted to authenticated users.
  */
-@RestController
-@RequestMapping("/api")
+@RestController   //so spring boot know this is the api
+@RequestMapping("/api")   //add api to every api mapping
 public class UserController {
 
     private final UserService userService;

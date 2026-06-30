@@ -18,7 +18,7 @@ public class UserService {
 
     private final UserRepository userRepository;
 
-    @PersistenceContext
+    @PersistenceContext  //it tell database the entity object
     private EntityManager entityManager;
 
     public UserService(UserRepository userRepository) {

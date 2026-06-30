@@ -57,6 +57,9 @@ public class SecurityConfig {
                         new AntPathRequestMatcher("/api/register"),
                         // H2 console (dev only)
                         new AntPathRequestMatcher("/h2-console/**"),
+                        // Swagger
+                        new AntPathRequestMatcher("/swagger-ui/**"),
+                        new AntPathRequestMatcher("/v3/api-docs/**"),
                         // Browser UI public surface
                         new AntPathRequestMatcher("/login"),
                         new AntPathRequestMatcher("/logout"),
