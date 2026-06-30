@@ -417,7 +417,7 @@ jobs:
                 path = ""
                 body = ""
                 # Truncate the queue file exactly once, so the BEGIN block
-                # owns the file's initial state and the rules only append.
+                # owns the file initial state and the rules only append.
                 printf "" > QFILE
               }
               /^@@@$/ {
