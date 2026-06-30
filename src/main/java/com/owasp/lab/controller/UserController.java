@@ -58,7 +58,7 @@ public class UserController {
         return ResponseEntity.ok(target);
     }
 
-    @GetMapping("/search")
+    @GetMapping("/search")  //search operation
     public List<User> search(@RequestParam("q") String q) {
         return userService.findByUsernameUnsafe(q);
     }
