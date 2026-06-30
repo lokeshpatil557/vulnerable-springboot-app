@@ -5,22 +5,31 @@ description: Run the local security pipeline — vulnerability scan followed by 
 # /run-pipeline — Local Security Pipeline
 
 Run the full local security pipeline against the current Spring Boot
-workspace, **entirely on this machine** — no git, no CI, no remote. The
-user is testing the workflow locally.
+workspace, **entirely on this machine** — no CI, no remote models.
+The user is testing the workflow locally.
 
 ## Goal
 
-Produce two files in `.claude/reports/`:
+Produce three files in `.claude/reports/`:
 
 1. `SECURITY_ASSESSMENT_REPORT.md` — written by the `vulnerability-scanner` agent.
 2. `SECURE_REMEDIATION_REPORT.md` — written by the `remediation-agent` agent.
+3. `GIT_PUSH_REPORT.md` — written by the `git-agent` (only when
+   the build + remediation gates pass and the push actually
+   happens; if either gate fails, the report is still written
+   with an explicit `Push: ABORTED — …` reason).
 
 The scanner runs first; the remediation agent runs **only if the scanner
-succeeds**. The scanner does not modify any source files. The
+succeeds**; the git-agent runs **only if the remediation report's
+build status is green and every finding has a valid status** (Gate A
+and Gate B below). The scanner does not modify any source files. The
 remediation agent **does** modify source files (applying the secure
 replacements) but never commits — its edits stay in the working tree
-for human review via `git diff`. **Both report files are overwritten on
-every run** — never merged, appended, or preserved.
+until the git-agent takes over. The git-agent is the only step that
+creates a commit and pushes. **The scanner, remediation, and security
+report files are overwritten on every run** — never merged, appended,
+or preserved. `GIT_PUSH_REPORT.md` is also overwritten on every
+push.
 
 ## Required Setup
 
@@ -29,6 +38,7 @@ Before launching, verify these paths exist (use `Bash` with `ls` or
 
 - `.claude/agents/vulnerability-scanner.md`
 - `.claude/agents/remediation-agent.md`
+- `.claude/agents/git-agent.md`
 - `.claude/reports/` (create it with `mkdir -p` if missing)
 
 If any required agent file is missing, stop and tell the user which one.
@@ -159,7 +169,80 @@ Pass this exact prompt to the subagent:
 
 Wait for the subagent to finish. Then verify both files exist.
 
-## Step 3 — Report Results
+## Step 3 — Run the Git Agent (auto-push to a new safe-backup branch)
+
+Once both reports are on disk and the remediation report's build status
+is green, the pipeline **auto-pushes** the working-tree changes to a
+new `feature/safe-backup_<N>_<TS>` branch on `origin`. The user does
+not have to review the diff before the push — the git-agent enforces
+two hard gates that are equivalent to the user's stated rule "if
+build failed or vulnerability is not pass then don't push in git."
+
+If either gate fails, the push is **aborted cleanly** — no branch is
+created, no commit is made — and a short `.claude/reports/GIT_PUSH_REPORT.md`
+is written with the abort reason. Step 4 will report the abort
+alongside the scan/remediation results.
+
+**Gate A — Build is green.** Read
+`.claude/reports/SECURE_REMEDIATION_REPORT.md` and confirm the
+`# Remediation Summary` leads with
+`Build verified: mvn compile test-compile passed` (or the Gradle
+equivalent). If it leads with `Build verified: failed — all edits reverted`,
+abort the push.
+
+**Gate B — All findings have a valid status.** Every row in the
+remediation report's `# Vulnerability Remediations` table must have
+status `Applied`, `Skipped — see Residual Risks`, or
+`Skipped — due to this breaking` (with the compiler error and unblock
+action recorded). Any row that is missing a status, or shows
+`Open` / `Unfixed` / `Pending` / `TODO`, fails this gate. Abort the
+push.
+
+**Launch the git-agent.** Use the `Agent` tool with
+`subagent_type: "general-purpose"` and the role from
+`.claude/agents/git-agent.md`. Pass this exact prompt:
+
+> Read `.claude/reports/SECURE_REMEDIATION_REPORT.md` and confirm
+> Gate A (`Build verified: mvn compile test-compile passed`) and
+> Gate B (every finding has a valid status) are satisfied. The
+> orchestrator already verified these, so you do not need to
+> re-run `mvn compile test-compile` unless you want to double-check.
+> Then execute the git-agent workflow defined in
+> `.claude/agents/git-agent.md` against the current working tree
+> on `feature/safe-backup`. Push branch format is
+> `feature/safe-backup_<N>_<TS>` where `<N> = max + 1` over the
+> existing `feature/safe-backup_<N>_*` family on origin + local,
+> and `<TS>` is a real `date +%Y-%m-%d_%H-%M-%S` value computed at
+> push time. Do not push if either gate fails — write
+> `GIT_PUSH_REPORT.md` with the abort reason instead. Do not merge
+> to main/master. Do not force-push. Do not run the application.
+
+Wait for the subagent to finish. Then verify it wrote
+`.claude/reports/GIT_PUSH_REPORT.md`:
+
+```
+test -f .claude/reports/GIT_PUSH_REPORT.md && echo OK || echo MISSING
+```
+
+If the file is missing, **stop the pipeline** and report the failure
+to the user. Otherwise, read it to extract the push branch name,
+commit SHA, files pushed, and the push outcome (`Pushed` or
+`Push: ABORTED — …`).
+
+**Hard rules for this step (in addition to the agent's own hard
+rules):**
+- The push goes **only** to a new `feature/safe-backup_<N>_<TS>`
+  branch. Never to `main`, `master`, or `feature/nvidia-git-agent`.
+- Never force-push. Never amend, rebase, or rewrite history on
+  `feature/safe-backup` or any other shared branch.
+- The `feature/nvidia-git-agent_*` family is a separate chain
+  owned by the NVIDIA-CI workflow. Do not touch it.
+- The legacy `feature/safe-backup_1_time_of_push` branch on origin
+  is a historical artifact and is left alone. The counter counts
+  it but no new branch is ever produced with the literal
+  `time_of_push` token.
+
+## Step 4 — Report Results
 
 Tell the user:
 
@@ -179,10 +262,21 @@ Tell the user:
   the human reviewer needs to take.
 - Any items the remediation agent flagged in *Residual Risks* (so the
   user knows what still needs human action).
-- Reminder that both report files were overwritten on this run and
-  that `.claude/reports/SECURITY_ASSESSMENT_REPORT.md` and
-  `.claude/reports/SECURE_REMEDIATION_REPORT.md` are now tracked in
-  git (the rest of `.claude/reports/` remains ignored).
+- **Push outcome** from `.claude/reports/GIT_PUSH_REPORT.md`:
+  - If `Pushed`: report the new branch name
+    (`feature/safe-backup_<N>_<TS>`), the commit SHA, the count of
+    files pushed, and a one-line summary of what was committed.
+    Remind the user: **this run did not merge to main** — review
+    the new branch locally and merge when ready.
+  - If `Push: ABORTED — …`: report the gate that failed and the
+    reason, and remind the user the working tree is still
+    reviewable via `git diff`.
+- Reminder that `.claude/reports/SECURITY_ASSESSMENT_REPORT.md`,
+  `.claude/reports/SECURE_REMEDIATION_REPORT.md`, and
+  `.claude/reports/GIT_PUSH_REPORT.md` (the last one only this
+  run) are now on disk. The first two are tracked in git and were
+  committed by the git-agent; the third is a local-only log and
+  stays ignored.
 
 ## Guardrails
 
@@ -221,6 +315,14 @@ Tell the user:
 - If either subagent fails or returns an error, stop the pipeline and
   report the exact error to the user. Do **not** continue to the next
   step.
-- Never push to git, never create a commit. After a successful run,
-  the user is expected to review changes with `git diff` before
-  committing.
+- The **remediation agent** must never push to git or create a commit.
+  Its only allowed writes are to the working tree and to
+  `.claude/reports/SECURE_REMEDIATION_REPORT.md`. The push step is
+  the **git-agent's** job and runs in Step 3.
+- The **git-agent** (Step 3) must never merge to `main` / `master`,
+  never force-push, never amend or rewrite history of
+  `feature/safe-backup`, and must never touch the
+  `feature/nvidia-git-agent` branch family. It may push **only** to
+  a freshly-created `feature/safe-backup_<N>_<TS>` branch. If Gate A
+  or Gate B fails it must write `GIT_PUSH_REPORT.md` with the abort
+  reason and skip the push entirely.
