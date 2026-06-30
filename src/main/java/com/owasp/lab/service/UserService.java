@@ -32,6 +32,7 @@ public class UserService {
     // bound via :username.  User input is treated as a literal value
     // by Hibernate and can never alter the SQL structure.
     // -----------------------------------------------------------------
+    //Transactional is for the revert if any failed  
     @Transactional(readOnly = true)
     public List<User> findByUsernameUnsafe(String username) {
         try {
