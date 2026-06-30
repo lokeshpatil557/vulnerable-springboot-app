@@ -75,7 +75,7 @@ public class AuthController {
         return ResponseEntity.ok(userService.save(u));
     }
 
-    @PostMapping("/transfer")
+    @PostMapping("/transfer")  //required for transfer of money
     public ResponseEntity<?> transfer(@RequestBody Map<String, Object> body,
                                        @AuthenticationPrincipal UserDetails caller) {
         Long fromId = ((Number) body.get("fromId")).longValue();
