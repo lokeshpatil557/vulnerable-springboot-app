@@ -405,20 +405,27 @@ jobs:
             APPLIED=0
             # Use awk to walk the patch block line-by-line and properly parse
             # the @@@-delimited records. State machine: path -> body -> path...
+            # PATCH_QUEUE is the queue file we read back in the next step.
+            # It MUST be truncated once (in BEGIN), then appended-to (>>) for
+            # every write, otherwise multi-record patches lose everything but
+            # the last record.
             PATCH_QUEUE=$(mktemp)
-            
-            printf '%s\n' "$PATCHES" | awk '
-              BEGIN { 
+
+            printf '%s\n' "$PATCHES" | awk -v QFILE="$PATCH_QUEUE" '
+              BEGIN {
                 state = "path"
                 path = ""
                 body = ""
+                # Truncate the queue file exactly once, so the BEGIN block
+                # owns the file's initial state and the rules only append.
+                printf "" > QFILE
               }
               /^@@@$/ {
                 if (state == "body") {
-                  # End of body: output the complete record
-                  printf "%s\n", path > "'"$PATCH_QUEUE"'"
-                  printf "%s\n", body > "'"$PATCH_QUEUE"'"
-                  printf "RECORD_SEPARATOR\n" > "'"$PATCH_QUEUE"'"
+                  # End of body: append the complete record.
+                  printf "%s\n", path      >> QFILE
+                  printf "%s\n", body      >> QFILE
+                  printf "RECORD_SEPARATOR\n" >> QFILE
                   state = "path"
                   path = ""
                   body = ""
