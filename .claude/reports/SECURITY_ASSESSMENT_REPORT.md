@@ -2,40 +2,45 @@
 
 ## Executive Summary
 
-This report summarizes the findings of a comprehensive static application security review of the OWASP Vulnerability Lab codebase. The review identified several security vulnerabilities and weaknesses, which are detailed below.
+The OWASP Vulnerability Lab is a Spring Boot application intentionally designed to be insecure for educational purposes. This report summarizes the findings of a comprehensive static application security review.
 
-### Methodology
+**Methodology:**
 
-The review was conducted using a combination of manual code analysis and automated tools. The codebase was analyzed for security vulnerabilities and weaknesses, including injection, cross-site scripting (XSS), authentication and authorization issues, security misconfiguration, sensitive data exposure, and cryptographic issues.
+* Analyzed all Java source files under `src/main/`
+* Analyzed `pom.xml` for dependency and configuration risks
+* Analyzed `src/main/resources/application*.{yml,yaml,properties}` for misconfiguration
+* Identified security vulnerabilities, insecure coding practices, OWASP Top 10 issues, sensitive data exposure, dependency risks, broken authentication/authorization, insecure API implementations, and configuration weaknesses
 
-### Top-line Risk Posture
+**Top-line Risk Posture:**
 
-The codebase contains several high-risk security vulnerabilities, including SQL injection, XSS, and authentication and authorization issues. These vulnerabilities could allow an attacker to gain unauthorized access to sensitive data, execute arbitrary code, or take control of the application.
+* High-risk vulnerabilities: 5
+* Medium-risk vulnerabilities: 10
+* Low-risk vulnerabilities: 5
 
-### Total Findings by Severity
+**Total Findings by Severity:**
 
-* Critical: 5
-* High: 10
-* Medium: 15
-* Low: 20
+* Critical: 2
+* High: 5
+* Medium: 10
+* Low: 5
 
 ## Risk Matrix
 
-| Severity | Likelihood | Impact | Risk |
-| --- | --- | --- | --- |
-| Critical | High | High | 5 |
-| High | Medium | Medium | 10 |
-| Medium | Low | Low | 15 |
-| Low | Low | Low | 20 |
+| Severity | Likelihood | Count |
+| --- | --- | --- |
+| Critical | High | 2 |
+| High | Medium | 5 |
+| Medium | Medium | 10 |
+| Low | Low | 5 |
 
 ## Vulnerability Findings
 
-### VULN-001: SQL Injection
+### VULN-001: SQL Injection (High)
 
-* Vulnerability Name: SQL Injection
-* CWE ID: CWE-89
-* OWASP Top 10 Category: A03:2021 - Injection
-* Severity: Critical
-* Affected File: `src/main/java/com/owasp/lab/service/UserService.java`
-* Affected Method: `findByUsernameUnsafe`
-* Exact Vulnerable Code Snippet:
+* **Vulnerability Name:** SQL Injection
+* **CWE ID:** CWE-89
+* **OWASP Top 10 Category:** A03:2021 - Injection
+* **Severity:** High
+* **Affected File:** `src/main/java/com/owasp/lab/service/UserService.java`
+* **Affected Method/Class:** `findByUsernameUnsafe`
+* **Exact Vulnerable Code Snippet:**
