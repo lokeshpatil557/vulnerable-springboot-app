@@ -15,9 +15,9 @@ public class Comment {
 
     private String author;
 
-    // VULNERABILITY (A03:2021 - Injection / XSS):
-    // Body is stored raw; the controller will echo it back into HTML
-    // WITHOUT escaping. This is the XSS sink.
+    // REMEDIATION (A03:2021 - Injection / XSS): body is stored raw, but
+    // the read path (CommentViewController) HTML-escapes the value
+    // before rendering. Body length is bounded at 2000 chars.
     @Column(length = 2000)
     private String body;
 

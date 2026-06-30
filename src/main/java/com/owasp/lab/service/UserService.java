@@ -89,11 +89,27 @@ public class UserService {
         return userRepository.save(user);
     }
 
-    // VULNERABILITY (OWASP A01:2021 - Broken Access Control / IDOR):
-    // Returns any user by ID without verifying the requester is allowed
-    // to see them.
-    public User findByIdUnsafe(Long id) {
-        return userRepository.findById(id).orElse(null);
+    // REMEDIATION (OWASP A01:2021 - Broken Access Control / IDOR):
+    // The authorisation check now lives at the service boundary.
+    // Callers MUST supply the authenticated principal's username and
+    // either match the requested user id's owner OR hold ROLE_ADMIN.
+    // Returns null both when the record is missing AND when the
+    // caller is not authorised to see it, so a 404 at the controller
+    // layer does not leak the existence of records.
+    public User findByIdForCaller(Long id, String callerUsername, boolean callerIsAdmin) {
+        User target = userRepository.findById(id).orElse(null);
+        if (target == null) {
+            return null;
+        }
+        if (callerIsAdmin) {
+            return target;
+        }
+        if (callerUsername != null && callerUsername.equals(target.getUsername())) {
+            return target;
+        }
+        // Return null to signal "not authorised" without leaking
+        // existence of the record.
+        return null;
     }
 
     public List<User> findAll() {
