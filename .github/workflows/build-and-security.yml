@@ -83,9 +83,16 @@ jobs:
     steps:
       # -----------------------------------------------------------
       # 2a. Checkout the source so the agents have something to scan.
+      #     fetch-depth: 0 is required so gitleaks-action@v2 can resolve
+      #     the rev-walk it builds on push events (it references the
+      #     parent of the merge base — e.g. c016eee2bc...^ — which a
+      #     shallow clone does not have). Without this the scan fails
+      #     with: fatal: unknown revision or path not in the working tree.
       # -----------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
