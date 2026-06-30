@@ -134,6 +134,7 @@ jobs:
           set -euo pipefail
           if [ -z "${NVIDIA_API_KEY:-}" ]; then
             echo "::error::NVIDIA_API_KEY repository secret is not set."
+            echo "Please add NVIDIA_API_KEY to your repository secrets."
             exit 1
           fi
 
@@ -170,6 +171,12 @@ jobs:
 
           SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
 
+          echo "=== NVIDIA SCAN: Preparing request ==="
+          echo "Payload size: $(wc -c < "$USER_PAYLOAD") bytes"
+          echo "System prompt file: $SYSTEM_PROMPT_FILE"
+          echo "Model: $NVIDIA_MODEL"
+          echo "Endpoint: $NVIDIA_BASE_URL"
+
           # Build the JSON request body safely with jq.
           REQUEST_BODY=$(jq -n \
             --arg model  "$NVIDIA_MODEL" \
@@ -183,7 +190,10 @@ jobs:
                 {role: "user",   content: $user}
               ]}')
 
+          echo "Request body size: $(echo "$REQUEST_BODY" | wc -c) bytes"
+
           RESPONSE_FILE=$(mktemp)
+          echo "=== NVIDIA SCAN: Calling API ==="
           HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" \
             -H "Authorization: Bearer $NVIDIA_API_KEY" \
             -H "Content-Type: application/json" \
@@ -191,9 +201,13 @@ jobs:
             -X POST "$NVIDIA_BASE_URL" \
             -d "$REQUEST_BODY" || echo "000")
 
+          echo "HTTP Response Code: $HTTP_CODE"
+
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::NVIDIA scan HTTP $HTTP_CODE"
+            echo "::error::NVIDIA scan HTTP $HTTP_CODE (expected 200)"
+            echo "=== NVIDIA API Response ==="
             cat "$RESPONSE_FILE" || true
+            echo "=== End Response ==="
             exit 1
           fi
 
@@ -201,9 +215,13 @@ jobs:
           ASSISTANT=$(jq -r '.choices[0].message.content // ""' "$RESPONSE_FILE")
           if [ -z "$ASSISTANT" ]; then
             echo "::error::NVIDIA scan returned empty assistant content."
+            echo "=== Full Response ==="
             cat "$RESPONSE_FILE" || true
+            echo "=== End Response ==="
             exit 1
           fi
+
+          echo "Assistant response size: $(echo "$ASSISTANT" | wc -c) bytes"
 
           # Extract the first ```markdown ... ``` (or ``` ... ```) block.
           # Strategy: take content between the first ``` line and the next ``` line.
@@ -215,15 +233,15 @@ jobs:
 
           if [ -z "$REPORT" ]; then
             echo "::error::No fenced code block found in NVIDIA scan response."
-            echo "--- raw assistant content (first 4000 chars) ---"
-            printf '%s\n' "$ASSISTANT" | head -c 4000
+            echo "--- raw assistant content (first 2000 chars) ---"
+            printf '%s\n' "$ASSISTANT" | head -c 2000
             echo
             echo "--- end ---"
             exit 1
           fi
 
           printf '%s\n' "$REPORT" > "$ASSESSMENT_REPORT"
-          echo "Wrote $ASSESSMENT_REPORT ($(wc -c < "$ASSESSMENT_REPORT") bytes)."
+          echo "✓ Wrote $ASSESSMENT_REPORT ($(wc -c < "$ASSESSMENT_REPORT") bytes)."
 
       - name: Upload security assessment report
         if: always() && hashFiles(env.ASSESSMENT_REPORT) != ''
@@ -249,6 +267,7 @@ jobs:
           set -euo pipefail
           if [ -z "${NVIDIA_API_KEY:-}" ]; then
             echo "::error::NVIDIA_API_KEY repository secret is not set."
+            echo "Please add NVIDIA_API_KEY to your repository secrets."
             exit 1
           fi
           if [ ! -s "$ASSESSMENT_REPORT" ]; then
@@ -289,17 +308,11 @@ jobs:
           } > "$USER_PAYLOAD"
 
           echo "=================================="
-          echo "ASSESSMENT REPORT SIZE"
-          wc -c "$ASSESSMENT_REPORT"
-
-          echo "=================================="
-          echo "PROMPT SIZE"
-          wc -c "$USER_PAYLOAD"
-
-          echo "=================================="
-          echo "FIRST 20 LINES OF PAYLOAD"
-          head -20 "$USER_PAYLOAD"
-
+          echo "NVIDIA REMEDIATE: Preparing request"
+          echo "Assessment report size: $(wc -c < "$ASSESSMENT_REPORT") bytes"
+          echo "Payload size: $(wc -c < "$USER_PAYLOAD") bytes"
+          echo "Model: $NVIDIA_MODEL"
+          echo "Endpoint: $NVIDIA_BASE_URL"
           echo "=================================="
 
           REQUEST_BODY=$(jq -n \
@@ -314,6 +327,9 @@ jobs:
                 {role: "user",   content: $user}
               ]}')
 
+          echo "Request body size: $(echo "$REQUEST_BODY" | wc -c) bytes"
+          echo "=== NVIDIA REMEDIATE: Calling API ==="
+
           RESPONSE_FILE=$(mktemp)
           HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" \
             -H "Authorization: Bearer $NVIDIA_API_KEY" \
@@ -322,18 +338,26 @@ jobs:
             -X POST "$NVIDIA_BASE_URL" \
             -d "$REQUEST_BODY" || echo "000")
 
+          echo "HTTP Response Code: $HTTP_CODE"
+
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::NVIDIA remediate HTTP $HTTP_CODE"
+            echo "::error::NVIDIA remediate HTTP $HTTP_CODE (expected 200)"
+            echo "=== NVIDIA API Response ==="
             cat "$RESPONSE_FILE" || true
+            echo "=== End Response ==="
             exit 1
           fi
 
           ASSISTANT=$(jq -r '.choices[0].message.content // ""' "$RESPONSE_FILE")
           if [ -z "$ASSISTANT" ]; then
             echo "::error::NVIDIA remediate returned empty assistant content."
+            echo "=== Full Response ==="
             cat "$RESPONSE_FILE" || true
+            echo "=== End Response ==="
             exit 1
           fi
+
+          echo "✓ Assistant response received: $(echo "$ASSISTANT" | wc -c) bytes"
 
           # Block 1: ```nvidia-patches ... ```
           PATCHES=$(printf '%s\n' "$ASSISTANT" \
@@ -364,7 +388,7 @@ jobs:
 
           # Always write the remediation report (it documents the run either way).
           printf '%s\n' "$REPORT_BODY" > "$REMEDIATION_REPORT"
-          echo "Wrote $REMEDIATION_REPORT ($(wc -c < "$REMEDIATION_REPORT") bytes)."
+          echo "✓ Wrote $REMEDIATION_REPORT ($(wc -c < "$REMEDIATION_REPORT") bytes)."
 
           # Apply patches if any. Patch file format: lines, with `@@@` on its
           # own line separating path from body, and `@@@` on its own line
@@ -372,40 +396,89 @@ jobs:
           # between this `@@@` and the next `@@@`.
           if [ -n "$PATCHES" ]; then
             APPLIED=0
-            # Use awk to walk the patch block and emit one
-            # (path)\t(body-to-heredoc) record per file.
+            # Use awk to walk the patch block line-by-line and properly parse
+            # the @@@-delimited records. State machine: path -> body -> path...
             PATCH_QUEUE=$(mktemp)
-            printf '%s' "$PATCHES" | awk '
-              BEGIN { state = "path"; path = ""; body = ""; }
+            
+            printf '%s\n' "$PATCHES" | awk '
+              BEGIN { 
+                state = "path"
+                path = ""
+                body = ""
+              }
               /^@@@$/ {
                 if (state == "body") {
-                  printf "%s\t%s\n", path, body > "'"$PATCH_QUEUE"'"
-                  state = "path"; path = ""; body = ""; next
+                  # End of body: output the complete record
+                  printf "%s\n", path > "'"$PATCH_QUEUE"'"
+                  printf "%s\n", body > "'"$PATCH_QUEUE"'"
+                  printf "RECORD_SEPARATOR\n" > "'"$PATCH_QUEUE"'"
+                  state = "path"
+                  path = ""
+                  body = ""
+                  next
                 }
-                if (state == "path") { state = "body"; next }
+                if (state == "path") {
+                  # Transition to body
+                  state = "body"
+                  next
+                }
               }
-              state == "path" { path = (path == "" ? $0 : path "\n" $0) }
-              state == "body" { body = (body == "" ? $0 : body "\n" $0) }
-              END {
-                if (state == "body" && path != "") {
-                  printf "%s\t%s\n", path, body > "'"$PATCH_QUEUE"'"
-                }
+              state == "path" {
+                # Accumulate path lines
+                path = (path == "" ? $0 : path "\n" $0)
+                next
+              }
+              state == "body" {
+                # Accumulate body lines
+                body = (body == "" ? $0 : body "\n" $0)
+                next
               }
             '
-            while IFS=$(printf '\t') read -r PFILE PBODY; do
-              [ -z "$PFILE" ] && continue
-              # Security: refuse paths that escape the repo or are absolute.
-              case "$PFILE" in
-                /*|..*|*/../*|*/..) echo "::error::refusing unsafe patch path: $PFILE"; exit 1;;
-              esac
-              mkdir -p "$(dirname "$PFILE")"
-              printf '%s\n' "$PBODY" > "$PFILE"
-              APPLIED=$((APPLIED+1))
-              echo "Patched $PFILE"
+            
+            # Read patch records from PATCH_QUEUE (path, then body, then separator)
+            CURRENT_PATH=""
+            CURRENT_BODY=""
+            while IFS= read -r line; do
+              if [ "$line" = "RECORD_SEPARATOR" ]; then
+                # Process the accumulated patch
+                if [ -n "$CURRENT_PATH" ]; then
+                  # Trim whitespace
+                  CURRENT_PATH=$(printf '%s' "$CURRENT_PATH" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                  
+                  # Security: refuse paths that escape the repo or are absolute.
+                  if printf '%s' "$CURRENT_PATH" | grep -qE '^/|/\.\./|\.\./|/\.\.$'; then
+                    echo "::error::refusing unsafe patch path: $CURRENT_PATH"
+                    exit 1
+                  fi
+                  
+                  # Validate path format (alphanumeric, dots, slashes, hyphens, underscores)
+                  if ! printf '%s' "$CURRENT_PATH" | grep -qE '^[a-zA-Z0-9._/-]+$'; then
+                    echo "::warning::skipping suspicious patch path: $CURRENT_PATH"
+                    CURRENT_PATH=""
+                    CURRENT_BODY=""
+                    continue
+                  fi
+                  
+                  # Write the file
+                  mkdir -p "$(dirname "$CURRENT_PATH")"
+                  printf '%s\n' "$CURRENT_BODY" > "$CURRENT_PATH"
+                  APPLIED=$((APPLIED+1))
+                  echo "✓ Patched $CURRENT_PATH"
+                fi
+                CURRENT_PATH=""
+                CURRENT_BODY=""
+              elif [ -z "$CURRENT_PATH" ]; then
+                # First line after separator (or start) is the path
+                CURRENT_PATH="$line"
+              else
+                # All subsequent lines until RECORD_SEPARATOR are body
+                CURRENT_BODY="$(printf '%s\n%s' "$CURRENT_BODY" "$line")"
+              fi
             done < "$PATCH_QUEUE"
+            
             echo "Applied $APPLIED file(s)."
           else
-            echo "No patches emitted by NVIDIA (empty patch block)."
+            echo "ℹ No patches emitted by NVIDIA (empty patch block)."
           fi
 
       - name: Compile check (gate A)
@@ -424,7 +497,7 @@ jobs:
             {
               echo
               echo
-              echo "> **Build verified: failed — all edits reverted** (workflow forced this line after `mvn -B -q compile test-compile` exited non-zero)."
+              echo "> **Build verified: failed — all edits reverted** (workflow forced this line after \`mvn -B -q compile test-compile\` exited non-zero)."
             } >> "$REMEDIATION_REPORT"
           fi
 
