@@ -15,16 +15,16 @@ import java.util.Map;
  * Authentication endpoints.
  *
  * REMEDIATION summary:
- *  - VULN-002: loginUnsafe now uses parameterised SQL and a
- *    PasswordEncoder.matches() hash compare.
- *  - VULN-004: passwords are hashed on register before persistence.
- *  - VULN-006: /transfer requires authentication and verifies the
- *    caller's principal matches the source user.
- *  - VULN-009: the /api/login response no longer contains the password.
- *  - VULN-012: /register binds to a server-side DTO and the role is
- *    always forced to "USER".  ADMIN elevation requires a separate,
- *    authenticated flow.
- *  - VULN-015: failed login attempts are logged via SLF4J.
+ * - VULN-002: loginUnsafe now uses parameterised SQL and a
+ * PasswordEncoder.matches() hash compare.
+ * - VULN-004: passwords are hashed on register before persistence.
+ * - VULN-006: /transfer requires authentication and verifies the
+ * caller's principal matches the source user.
+ * - VULN-009: the /api/login response no longer contains the password.
+ * - VULN-012: /register binds to a server-side DTO and the role is
+ * always forced to "USER". ADMIN elevation requires a separate,
+ * authenticated flow.
+ * - VULN-015: failed login attempts are logged via SLF4J.
  */
 @RestController
 @RequestMapping("/api")
@@ -57,18 +57,17 @@ public class AuthController {
         return ResponseEntity.ok(Map.of(
                 "id", u.getId(),
                 "username", u.getUsername(),
-                "role", u.getRole()
-        ));
+                "role", u.getRole()));
     }
 
     @PostMapping("/register")
     public ResponseEntity<User> register(@RequestBody Map<String, String> body) {
         String username = body.getOrDefault("username", "");
         String password = body.getOrDefault("password", "");
-        String email    = body.getOrDefault("email", "");
+        String email = body.getOrDefault("email", "");
 
         // REMEDIATION (A01:2021 / A04:2021): the role is ALWAYS forced
-        // to USER server-side.  Even if the caller supplies a role
+        // to USER server-side. Even if the caller supplies a role
         // field, it is ignored - ADMIN elevation must go through an
         // authenticated, audited admin-only endpoint.
         User u = new User(username, passwordEncoder.encode(password), email, "USER", 0.0);
@@ -77,9 +76,9 @@ public class AuthController {
 
     @PostMapping("/transfer")
     public ResponseEntity<?> transfer(@RequestBody Map<String, Object> body,
-                                       @AuthenticationPrincipal UserDetails caller) {
+            @AuthenticationPrincipal UserDetails caller) {
         Long fromId = ((Number) body.get("fromId")).longValue();
-        Long toId   = ((Number) body.get("toId")).longValue();
+        Long toId = ((Number) body.get("toId")).longValue();
         Double amount = ((Number) body.get("amount")).doubleValue();
 
         // REMEDIATION (A01:2021 - IDOR): the caller must own the
@@ -115,7 +114,6 @@ public class AuthController {
         return ResponseEntity.ok(Map.of(
                 "status", "ok",
                 "fromBalance", from.getBalance(),
-                "toBalance", to.getBalance()
-        ));
+                "toBalance", to.getBalance()));
     }
 }

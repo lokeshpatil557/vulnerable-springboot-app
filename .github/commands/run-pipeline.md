@@ -10,7 +10,7 @@ user is testing the workflow locally.
 
 ## Goal
 
-Produce two files in `.claude/reports/`:
+Produce two files in `.github/reports/`:
 
 1. `SECURITY_ASSESSMENT_REPORT.md` — written by the `vulnerability-scanner` agent.
 2. `SECURE_REMEDIATION_REPORT.md` — written by the `remediation-agent` agent.
@@ -27,9 +27,9 @@ every run** — never merged, appended, or preserved.
 Before launching, verify these paths exist (use `Bash` with `ls` or
 `Glob`):
 
-- `.claude/agents/vulnerability-scanner.md`
-- `.claude/agents/remediation-agent.md`
-- `.claude/reports/` (create it with `mkdir -p` if missing)
+- `.github/agents/vulnerability-scanner.md`
+- `.github/agents/remediation-agent.md`
+- `.github/reports/` (create it with `mkdir -p` if missing)
 
 If any required agent file is missing, stop and tell the user which one.
 
@@ -37,21 +37,21 @@ If any required agent file is missing, stop and tell the user which one.
 
 Launch the `vulnerability-scanner` subagent (use the `Agent` tool with
 `subagent_type: "general-purpose"` and the role from
-`.claude/agents/vulnerability-scanner.md`).
+`.github/agents/vulnerability-scanner.md`).
 
 Pass this exact prompt to the subagent:
 
 > Perform a comprehensive static security review of the Spring Boot
 > workspace at the current repo root. Do **not** modify any source code.
-> Write the report to **`.claude/reports/SECURITY_ASSESSMENT_REPORT.md`**
+> Write the report to **`.github/reports/SECURITY_ASSESSMENT_REPORT.md`**
 > (override of your default repo-root path — the user has chosen
-> `.claude/reports/` for this local run). After writing, confirm the
+> `.github/reports/` for this local run). After writing, confirm the
 > file exists on disk and report its absolute path.
 
 Wait for the subagent to finish. Then verify the file exists:
 
 ```
-test -f .claude/reports/SECURITY_ASSESSMENT_REPORT.md && echo OK || echo MISSING
+test -f .github/reports/SECURITY_ASSESSMENT_REPORT.md && echo OK || echo MISSING
 ```
 
 If the file is missing, **stop the pipeline** and report the failure to
@@ -61,11 +61,11 @@ the user. Do not run Step 2.
 
 Launch the `remediation-agent` subagent (use the `Agent` tool with
 `subagent_type: "general-purpose"` and the role from
-`.claude/agents/remediation-agent.md`).
+`.github/agents/remediation-agent.md`).
 
 Pass this exact prompt to the subagent:
 
-> Read `.claude/reports/SECURITY_ASSESSMENT_REPORT.md` as the source of
+> Read `.github/reports/SECURITY_ASSESSMENT_REPORT.md` as the source of
 > truth. Do **not** re-scan the codebase for new findings.
 >
 > **Direct-edit contract:** you are fully authorized by the pipeline
@@ -118,7 +118,7 @@ Pass this exact prompt to the subagent:
 > `git diff`.
 >
 > Then produce `SECURE_REMEDIATION_REPORT.md` at
-> **`.claude/reports/SECURE_REMEDIATION_REPORT.md`** with:
+> **`.github/reports/SECURE_REMEDIATION_REPORT.md`** with:
 > - The per-finding schema and top-level sections defined in your
 >   agent file (Remediation Summary, **Changes Made**, **Changes That
 >   Remained — Due To Build Breakage**, Files Referenced, Vulnerability
@@ -141,12 +141,12 @@ Pass this exact prompt to the subagent:
 >
 > Allowed tools: `Read`, `Glob`, `Grep`, `Edit` (only on source/config
 > files referenced in the assessment report), `Write` (only for
-> `.claude/reports/SECURE_REMEDIATION_REPORT.md`), and `Bash` (only
+> `.github/reports/SECURE_REMEDIATION_REPORT.md`), and `Bash` (only
 > for: build-tool detection, the compile-check command, `git status
 > --porcelain`, and `git checkout -- .` / per-file revert when the
 > build cannot be repaired). Do not run the application, do not
-> commit or push, do not modify `.claude/` or `.gitignore`, and do
-> not write outside `.claude/reports/`. Do not prompt the user for
+> commit or push, do not modify `.github/` or `.gitignore`, and do
+> not write outside `.github/reports/`. Do not prompt the user for
 > permission to edit — your authorization is the assessment report
 > itself.
 >
@@ -163,8 +163,8 @@ Wait for the subagent to finish. Then verify both files exist.
 
 Tell the user:
 
-- Absolute path of `.claude/reports/SECURITY_ASSESSMENT_REPORT.md`
-- Absolute path of `.claude/reports/SECURE_REMEDIATION_REPORT.md`
+- Absolute path of `.github/reports/SECURITY_ASSESSMENT_REPORT.md`
+- Absolute path of `.github/reports/SECURE_REMEDIATION_REPORT.md`
 - **Build status** from the remediation report (`Build verified:
   passed` or `Build verified: failed — all edits reverted`).
 - Top-line counts from the remediation report, with the two Skip
@@ -180,9 +180,9 @@ Tell the user:
 - Any items the remediation agent flagged in *Residual Risks* (so the
   user knows what still needs human action).
 - Reminder that both report files were overwritten on this run and
-  that `.claude/reports/SECURITY_ASSESSMENT_REPORT.md` and
-  `.claude/reports/SECURE_REMEDIATION_REPORT.md` are now tracked in
-  git (the rest of `.claude/reports/` remains ignored).
+  that `.github/reports/SECURITY_ASSESSMENT_REPORT.md` and
+  `.github/reports/SECURE_REMEDIATION_REPORT.md` are now tracked in
+  git (the rest of `.github/reports/` remains ignored).
 
 ## Guardrails
 
@@ -191,7 +191,7 @@ Tell the user:
 - The **remediation agent** is allowed to `Edit` source/config files
   **only** those that the assessment report references as affected
   files. It must never run git commands, must never write outside
-  `.claude/reports/`, and must never touch `.claude/` or `.gitignore`.
+  `.github/reports/`, and must never touch `.github/` or `.gitignore`.
   If it edits a file that was not referenced in the assessment report,
   abort and surface the violation.
 - The **remediation agent must not ask the user or developer for
