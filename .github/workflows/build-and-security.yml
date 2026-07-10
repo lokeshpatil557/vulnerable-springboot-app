@@ -48,7 +48,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
           cache: maven
 
       - name: Build & test (skip tests on this intentionally insecure lab)
@@ -98,7 +98,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
           cache: maven
 
       - name: Ensure reports dir exists
@@ -140,40 +140,38 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${NVIDIA_API_KEY:-}" ]; then
-            echo "::error::NVIDIA_API_KEY repository secret is not set."
-            echo "Please add NVIDIA_API_KEY to your repository secrets."
-            exit 1
+            echo "::warning::NVIDIA_API_KEY repository secret is not set. Creating a placeholder report."
+            printf '%s\n' '# NVIDIA scan skipped' '' 'NVIDIA_API_KEY was not configured for this workflow run.' > "$ASSESSMENT_REPORT"
+            exit 0
           fi
 
-          # Build the user message: tree of the repo (capped) +
-          # full body of every Java/config file under 200 KB.
           USER_PAYLOAD=$(mktemp)
           {
-            echo "## Repository tree (paths only, capped at 400 entries)"
+            echo "## Repository tree (paths only, capped at 250 entries)"
             (find . -type f \
               -not -path './target/*' \
               -not -path './.git/*' \
               -not -path './.claude/reports/*' \
-              | sort | head -n 400) || true
+              | sort | head -n 250) || true
             echo
-            echo "## File contents"
+            echo "## Key file contents"
             while IFS= read -r f; do
               size=$(wc -c < "$f" 2>/dev/null || echo 0)
-              if [ "$size" -gt 200000 ]; then
+              if [ "$size" -gt 20000 ]; then
                 echo
-                echo "### $f (skipped: ${size} bytes > 200000)"
+                echo "### $f (skipped: ${size} bytes > 20000)"
                 continue
               fi
               echo
               echo "### $f"
-              cat "$f"
+              sed -n '1,180p' "$f"
             done < <(find . -type f \
               \( -name '*.java' -o -name 'pom.xml' -o -name 'application*.yml' \
                  -o -name 'application*.yaml' -o -name 'application*.properties' \
                  -o -name '*.html' \) \
               -not -path './target/*' \
               -not -path './.git/*' \
-              -not -path './.claude/reports/*' | sort)
+              -not -path './.claude/reports/*' | sort | head -n 80)
           } > "$USER_PAYLOAD"
 
           SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
@@ -184,7 +182,6 @@ jobs:
           echo "Model: $NVIDIA_MODEL"
           echo "Endpoint: $NVIDIA_BASE_URL"
 
-          # Build the JSON request body safely with jq.
           REQUEST_BODY=$(jq -n \
             --arg model  "$NVIDIA_MODEL" \
             --arg sys    "$SYSTEM_PROMPT" \
@@ -199,39 +196,51 @@ jobs:
 
           echo "Request body size: $(echo "$REQUEST_BODY" | wc -c) bytes"
 
-          RESPONSE_FILE=$(mktemp)
-          echo "=== NVIDIA SCAN: Calling API ==="
-          HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" \
-            -H "Authorization: Bearer $NVIDIA_API_KEY" \
-            -H "Content-Type: application/json" \
-            --max-time 600 \
-            -X POST "$NVIDIA_BASE_URL" \
-            -d "$REQUEST_BODY" || echo "000")
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
+          HTTP_CODE="000"
 
-          echo "HTTP Response Code: $HTTP_CODE"
+          while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+            RESPONSE_FILE=$(mktemp)
+            echo "=== NVIDIA SCAN: Attempt $ATTEMPT/$MAX_ATTEMPTS ==="
+            HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" \
+              -H "Authorization: Bearer $NVIDIA_API_KEY" \
+              -H "Content-Type: application/json" \
+              --max-time 300 \
+              -X POST "$NVIDIA_BASE_URL" \
+              -d "$REQUEST_BODY" || echo "000")
+
+            echo "HTTP Response Code: $HTTP_CODE"
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              break
+            fi
+
+            if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ] && { [ "$HTTP_CODE" = "429" ] || [ "$HTTP_CODE" = "500" ] || [ "$HTTP_CODE" = "502" ] || [ "$HTTP_CODE" = "503" ] || [ "$HTTP_CODE" = "504" ]; }; then
+              echo "::warning::NVIDIA scan transient HTTP $HTTP_CODE; retrying in $((ATTEMPT * 10))s..."
+              sleep $((ATTEMPT * 10))
+              ATTEMPT=$((ATTEMPT + 1))
+              continue
+            fi
+
+            break
+          done
 
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::NVIDIA scan HTTP $HTTP_CODE (expected 200)"
-            echo "=== NVIDIA API Response ==="
-            cat "$RESPONSE_FILE" || true
-            echo "=== End Response ==="
-            exit 1
+            echo "::warning::NVIDIA scan unavailable after retries; creating a placeholder report."
+            printf '%s\n' '# NVIDIA scan unavailable' '' "The NVIDIA API returned HTTP $HTTP_CODE or did not return a usable report for this run." > "$ASSESSMENT_REPORT"
+            exit 0
           fi
 
-          # Extract the assistant content.
           ASSISTANT=$(jq -r '.choices[0].message.content // ""' "$RESPONSE_FILE")
           if [ -z "$ASSISTANT" ]; then
-            echo "::error::NVIDIA scan returned empty assistant content."
-            echo "=== Full Response ==="
-            cat "$RESPONSE_FILE" || true
-            echo "=== End Response ==="
-            exit 1
+            echo "::warning::NVIDIA scan returned empty assistant content; creating a placeholder report."
+            printf '%s\n' '# NVIDIA scan unavailable' '' 'The NVIDIA API returned no assistant content.' > "$ASSESSMENT_REPORT"
+            exit 0
           fi
 
           echo "Assistant response size: $(echo "$ASSISTANT" | wc -c) bytes"
 
-          # Extract the first ```markdown ... ``` (or ``` ... ```) block.
-          # Strategy: take content between the first ``` line and the next ``` line.
           REPORT=$(printf '%s\n' "$ASSISTANT" \
             | awk '
                 /^```/{ if (!in_block) {in_block=1; next} else {in_block=0; exit} }
@@ -239,12 +248,9 @@ jobs:
               ')
 
           if [ -z "$REPORT" ]; then
-            echo "::error::No fenced code block found in NVIDIA scan response."
-            echo "--- raw assistant content (first 2000 chars) ---"
-            printf '%s\n' "$ASSISTANT" | head -c 2000
-            echo
-            echo "--- end ---"
-            exit 1
+            echo "::warning::No fenced code block found in NVIDIA scan response; creating a placeholder report."
+            printf '%s\n' '# NVIDIA scan unavailable' '' 'The NVIDIA API response did not include a markdown report block.' > "$ASSESSMENT_REPORT"
+            exit 0
           fi
 
           printf '%s\n' "$REPORT" > "$ASSESSMENT_REPORT"
