@@ -133,33 +133,36 @@ jobs:
       #   Llama-3.1-70B on the free build.nvidia.com tier caps output at
       #   16,384 tokens per request, but the scanner spec demands a long
       #   report that frequently exceeds 8k tokens of output. We solve
-      #   this by issuing one API call per report section and stitching
-      #   the results together. Sections, in order:
+      #   this by issuing one API call per report section, then running
+      #   a "completion loop": after the first pass, we check which
+      #   sections are missing and re-call them — up to MAX_PASSES
+      #   total passes — until the report has all six sections or the
+      #   workflow fails. This satisfies the requirement that the scanner
+      #   keep calling the model until a full report is produced.
       #
+      #   Sections, in order:
       #     1. Executive Summary
       #     2. Risk Matrix
-      #     3. Vulnerability Findings  (the longest section — chunked
-      #        further if it exceeds the per-request output budget)
+      #     3. Vulnerability Findings  (longest — most likely to be
+      #        re-called if it comes back empty)
       #     4. OWASP Top 10 Mapping
       #     5. CWE Mapping
       #     6. Priority Remediation Roadmap
-      #
-      #   Each call gets:
-      #     - the full repo file dump (one consolidated input payload
-      #       built once, reused across calls)
-      #     - a tight system prompt that names the section + output shape
-      #     - max_tokens = NVIDIA_MAX_TOKENS (8192) so the model can
-      #       always finish the section without hitting the cap
-      #
-      #   The workflow extracts each fenced block, appends to the
-      #   report, and validates the report is non-empty + contains
-      #   "# Executive Summary" before the next steps run.
       # -----------------------------------------------------------
       - name: nvidia-scan
         id: nvidia_scan
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           SYSTEM_PROMPT_FILE: .claude/agents/nvidia-vulnerability-scanner.md
+          # How many outer passes to attempt. Each pass issues up to
+          # six section calls, but only for sections that are still
+          # missing from the report. Hard cap so we don't loop forever
+          # if the model is broken.
+          MAX_PASSES: "4"
+          # Per-call retry budget. A section is re-called (with the
+          # same prompt) if the API returned 0 bytes or the fenced
+          # block couldn't be extracted.
+          MAX_SECTION_RETRIES: "2"
         run: |
           set -euo pipefail
           if [ -z "${NVIDIA_API_KEY:-}" ]; then
@@ -172,11 +175,10 @@ jobs:
           # 1. Build the shared input payload once: a curated set of
           #    files (the ones most likely to contain security findings)
           #    plus a tree. We do NOT ship every Java/HTML/yml file
-          #    verbatim anymore — that ate the context window and gave
-          #    the model no room to write the report. We DO ship the
+          #    verbatim — that ate the context window and gave the
+          #    model no room to write the report. We DO ship the
           #    high-signal files: security config, controllers, repos,
-          #    any file mentioned in pom.xml's dependencies, and the
-          #    application config.
+          #    pom.xml, and the application config.
           # ------------------------------------------------------------
           USER_PAYLOAD=$(mktemp)
           {
@@ -190,8 +192,7 @@ jobs:
             echo
             echo "## File contents (curated — high-signal files only)"
             # Files most likely to contain findings. 16k-byte cap per
-            # file keeps the payload bounded; we never hit a 80kB
-            # spring-boot config in this lab.
+            # file keeps the payload bounded.
             while IFS= read -r f; do
               [ -z "$f" ] && continue
               [ ! -f "$f" ] && continue
@@ -225,8 +226,8 @@ jobs:
                    -o -iname '*Login*' \
                    -o -iname '*Token*' \
                    -o -iname '*Jwt*' \) 2>/dev/null || true
-              # All controllers, services, repositories — the main attack
-              # surface for a Spring Boot app.
+              # All controllers, services, repositories — the main
+              # attack surface for a Spring Boot app.
               find src -type f -name '*.java' \
                 \( -path '*/controller/*' -o -path '*/controllers/*' \
                    -o -path '*/service/*' -o -path '*/services/*' \
@@ -249,47 +250,54 @@ jobs:
           echo "Model: $NVIDIA_MODEL"
           echo "Endpoint: $NVIDIA_BASE_URL"
           echo "Max tokens per request: $NVIDIA_MAX_TOKENS"
+          echo "Max outer passes: $MAX_PASSES"
+          echo "Max per-section retries: $MAX_SECTION_RETRIES"
 
           # ------------------------------------------------------------
-          # 2. Helper: do_one_section <section-id> <section-prompt>
+          # 2. do_one_section <section-id> <section-prompt-file>
           #
           #    Issues one API call. The system prompt + payload are
           #    identical across calls; only the user-message tail
           #    (the "section prompt") changes. The assistant's reply
-          #    is expected to be a single fenced ```markdown``` block
+          #    is expected to be a single fenced ~~~~markdown block
           #    containing JUST that section. The function extracts the
-          #    block, strips the leading "# <Section Name>" header so
-          #    we don't double-print it, and appends to the report.
+          #    block and appends it to the report.
           #
-          #    Returns 0 on success, 1 on failure (logged + aborts).
+          #    Returns 0 on success, 1 on a hard failure. If the call
+          #    itself succeeded but the fenced block came back empty,
+          #    returns 2 — caller (the section retry loop) decides
+          #    whether to retry.
           # ------------------------------------------------------------
           do_one_section() {
             local section_id="$1"
-            local section_prompt="$2"
-            local section_file="$3"   # the file to append into
-            local section_log="$4"    # log file for this section's transcript
+            local section_prompt_file="$2"   # file holding the per-section prompt
+            local section_file="$3"          # report parts file to append into
+            local section_log="$4"           # transcript log
 
             echo "--- nvidia-scan: requesting section '$section_id' ---"
 
-            # Build the per-section user message: payload + a tight
-            # instruction asking for ONLY this section.
+            # Build the per-section user message via a heredoc. This
+            # is the critical fix: previously the message was built
+            # by concatenating YAML double-quoted strings with literal
+            # newlines, which is invalid YAML. Heredocs are safe.
             local USER_MSG
-            USER_MSG=$(cat "$USER_PAYLOAD")
-            USER_MSG="${USER_MSG}
+            USER_MSG="$(cat "$USER_PAYLOAD")
 
----
+          ---
 
-## Section to produce NOW: ${section_id}
+          ## Section to produce NOW: ${section_id}
 
-${section_prompt}
+          $(cat "$section_prompt_file")
 
-Emit ONLY this section, formatted as a single Markdown fenced code block:
+          Emit ONLY this section, formatted as a single Markdown fenced code block.
+          Use exactly four tilde characters for the OUTER fence so any normal
+          triple-backtick code samples inside the section remain valid:
 
-\`\`\`markdown
-...this section's content, with its '# <Section Name>' header...
-\`\`\`
+          ~~~~markdown
+          ...this section's content, with its '# <Section Name>' header...
+          ~~~~
 
-No other sections. No preamble. No postamble. Stop after the closing fence."
+          No other sections. No preamble. No postamble. Stop after the closing fence."
 
             local REQUEST_BODY
             REQUEST_BODY=$(jq -n \
@@ -335,43 +343,45 @@ No other sections. No preamble. No postamble. Stop after the closing fence."
             rm -f "$RESPONSE_FILE"
             if [ -z "$ASSISTANT" ]; then
               echo "::error::[$section_id] NVIDIA scan returned empty assistant content."
-              return 1
+              return 2
             fi
 
             # Log full transcript for debugging.
             {
               echo "=== Section: $section_id ==="
-              echo "--- USER PROMPT TAIL ---"
-              printf '%s\n' "$section_prompt"
+              echo "--- USER PROMPT (truncated to 4000 chars) ---"
+              cat "$section_prompt_file" | head -c 4000
+              echo
               echo "--- ASSISTANT REPLY (raw, first 4000 chars) ---"
               printf '%s\n' "$ASSISTANT" | head -c 4000
               echo
               echo "--- END ---"
             } >> "$section_log"
 
-            # Extract the fenced block. Try ```markdown first, then
-            # plain ```. If neither is present, treat the whole
-            # assistant message as the section content (so the model
-            # can still succeed even if it forgets the info string).
+            # Extract the outer ~~~~markdown block. Four tildes let the
+            # generated section safely contain normal triple-backtick
+            # code blocks without truncating the report.
             local BLOCK
             BLOCK=$(printf '%s\n' "$ASSISTANT" \
               | awk '
-                  /^```markdown/{ if (!in_block) {in_block=1; next} else {in_block=0; exit} }
-                  /^```/{        if (!in_block && !tried_md) {tried_md=1; in_block=1; next}
-                                  else if (in_block) {in_block=0; exit} }
+                  /^~~~~markdown[[:space:]]*$/ { if (!in_block) {in_block=1; next} }
+                  /^~~~~[[:space:]]*$/         { if (in_block) {exit} }
                   in_block {print}
                 ')
 
             if [ -z "$BLOCK" ]; then
-              # Fallback: no fenced block at all. Accept the raw text.
-              echo "::warning::[$section_id] no fenced block found; using raw assistant content."
+              echo "::warning::[$section_id] no ~~~~markdown block found; using raw assistant content."
               BLOCK=$(printf '%s\n' "$ASSISTANT")
             fi
 
-            # Append to the report. We DON'T strip the "# Section"
-            # header — we want every section to be self-contained
-            # when concatenated, and the table of contents at the
-            # top of the report makes the headers useful.
+            if [ -z "$BLOCK" ]; then
+              echo "::error::[$section_id] block extraction produced empty content."
+              return 2
+            fi
+
+            # Append the section. We wrap each section in HTML-style
+            # comment markers so the outer loop can detect "this
+            # section is present" by grepping for the BEGIN marker.
             {
               echo
               echo "<!-- BEGIN SECTION: $section_id -->"
@@ -385,63 +395,177 @@ No other sections. No preamble. No postamble. Stop after the closing fence."
           }
 
           # ------------------------------------------------------------
-          # 3. Issue one call per section. Each section prompt is
-          #    intentionally narrow so the model doesn't burn its
-          #    output budget re-emitting the whole report.
+          # 3. Write the per-section prompts to temp files. The
+          #    do_one_section helper reads its prompt from a file
+          #    (not a YAML-inlined string) so we never have to fight
+          #    YAML's no-literal-newline-in-double-quotes rule.
+          # ------------------------------------------------------------
+          PROMPT_DIR=$(mktemp -d)
+          cat > "$PROMPT_DIR/executive_summary.txt" <<'PROMPT_EOF'
+          Produce the '# Executive Summary' section of SECURITY_ASSESSMENT_REPORT.md for this codebase. Cover: (a) the scope of the review (which files/areas you examined), (b) the methodology used (the check categories from your system prompt that you actually applied), (c) the top-line risk posture (one paragraph), and (d) a count of findings by severity (Critical/High/Medium/Low). Do NOT list individual findings here — that comes in the next section.
+          PROMPT_EOF
+
+          cat > "$PROMPT_DIR/risk_matrix.txt" <<'PROMPT_EOF'
+          Produce ONLY the '# Risk Matrix' section: a single Markdown table with columns 'Severity' and 'Likelihood', and rows for each combination (Critical/High/Medium/Low × High/Medium/Low). For each cell, give the count of findings that fall into that bucket based on your analysis of the input. Below the table, add one sentence explaining the methodology (e.g. severity = business impact, likelihood = exploitability given the current configuration).
+          PROMPT_EOF
+
+          cat > "$PROMPT_DIR/vulnerability_findings.txt" <<'PROMPT_EOF'
+          Produce ONLY the '# Vulnerability Findings' section. For EACH finding use this exact schema:
+
+          ### VULN-<NNN> — <Vulnerability Name>
+
+          - **CWE:** CWE-<id>
+          - **OWASP Top 10:** <category, e.g. A01:2021 - Broken Access Control>
+          - **Severity:** Critical | High | Medium | Low
+          - **Affected File:** `<repo-relative path>`
+          - **Affected Method / Class:** `<name>`
+          - **Vulnerable Code:**
+            ```java
+            <verbatim snippet — copy-paste from the input>
+            ```
+          - **Root Cause:** <one sentence>
+          - **Exploitation Scenario:** <one paragraph>
+          - **Business Impact:** <one paragraph>
+          - **Confidence:** High | Medium | Low
+
+          Order findings Critical → High → Medium → Low. If a check category yields no findings, you may omit it. Do NOT include any other section in your reply — just the findings, one after another, in the schema above.
+          PROMPT_EOF
+
+          cat > "$PROMPT_DIR/owasp_mapping.txt" <<'PROMPT_EOF'
+          Produce ONLY the '# OWASP Top 10 Mapping' section: for each OWASP Top 10 2021 category that has at least one finding in this codebase, list the category name and the VULN-IDs that map to it. Use a Markdown table or a per-category sub-list. Categories with zero findings may be omitted. Do NOT include any other section.
+          PROMPT_EOF
+
+          cat > "$PROMPT_DIR/cwe_mapping.txt" <<'PROMPT_EOF'
+          Produce ONLY the '# CWE Mapping' section: for each CWE that has at least one finding, list the CWE ID + name and the VULN-IDs that map to it. Use a Markdown table. CWEs with zero findings may be omitted. Do NOT include any other section.
+          PROMPT_EOF
+
+          cat > "$PROMPT_DIR/remediation_roadmap.txt" <<'PROMPT_EOF'
+          Produce ONLY the '# Priority Remediation Roadmap' section: an ordered list (Critical → Low) of concrete remediation steps, one per VULN-ID, with a 1-3 sentence fix recommendation each. End with a '## Next Steps' sub-section listing the top 3 actions the developer should take first. Do NOT include any other section.
+          PROMPT_EOF
+
+          # Section metadata. We iterate over this list to call
+          # do_one_section. The "id" is what we put in the BEGIN/END
+          # markers, and is also the heading we expect in the model
+          # reply (so the outer loop can verify presence).
+          SECTIONS=(
+            "Executive Summary|executive_summary"
+            "Risk Matrix|risk_matrix"
+            "Vulnerability Findings|vulnerability_findings"
+            "OWASP Top 10 Mapping|owasp_mapping"
+            "CWE Mapping|cwe_mapping"
+            "Priority Remediation Roadmap|remediation_roadmap"
+          )
+
+          # ------------------------------------------------------------
+          # 4. Completion loop. We do up to MAX_PASSES outer passes.
+          #    On each pass, for every section that is NOT yet present
+          #    in the report, call do_one_section. If the call
+          #    succeeds and the section marker is now in the report,
+          #    that section is "done" and won't be re-called. Sections
+          #    that keep returning empty blocks are retried up to
+          #    MAX_SECTION_RETRIES times before the workflow fails. A
+          #    partial report must never be accepted or committed.
           # ------------------------------------------------------------
           REPORT_PARTS=$(mktemp)
           SECTION_LOG=$(mktemp)
+          # Per-section retry counter. Tracks how many times we've
+          # tried each section in this run.
+          declare -A RETRY_COUNT
+          # Per-section "given up" flag. If a section hits its retry
+          # cap, we stop trying it and fail before assembling a report.
+          declare -A GIVEN_UP
+          for entry in "${SECTIONS[@]}"; do
+            slug="${entry##*|}"
+            RETRY_COUNT["$slug"]=0
+            GIVEN_UP["$slug"]=0
+          done
 
-          # Section 1: Executive Summary
-          do_one_section "Executive Summary" \
-            "Produce the '# Executive Summary' section of SECURITY_ASSESSMENT_REPORT.md for this codebase. Cover: (a) the scope of the review (which files/areas you examined), (b) the methodology used (the check categories from your system prompt that you actually applied), (c) the top-line risk posture (one paragraph), and (d) a count of findings by severity (Critical/High/Medium/Low). Do NOT list individual findings here — that comes in the next section." \
-            "$REPORT_PARTS" "$SECTION_LOG" || exit 1
+          pass=0
+          while [ "$pass" -lt "$MAX_PASSES" ]; do
+            pass=$((pass + 1))
+            echo "=== NVIDIA SCAN: outer pass $pass / $MAX_PASSES ==="
+            missing_in_pass=0
 
-          # Section 2: Risk Matrix
-          do_one_section "Risk Matrix" \
-            "Produce ONLY the '# Risk Matrix' section: a single Markdown table with columns 'Severity' and 'Likelihood', and rows for each combination (Critical/High/Medium/Low × High/Medium/Low). For each cell, give the count of findings that fall into that bucket based on your analysis of the input. Below the table, add one sentence explaining the methodology (e.g. severity = business impact, likelihood = exploitability given the current configuration)." \
-            "$REPORT_PARTS" "$SECTION_LOG" || exit 1
+            for entry in "${SECTIONS[@]}"; do
+              heading="${entry%%|*}"
+              slug="${entry##*|}"
 
-          # Section 3: Vulnerability Findings (the big one)
-          do_one_section "Vulnerability Findings" \
-            "Produce ONLY the '# Vulnerability Findings' section. For EACH finding use this exact schema:
+              # Skip sections that exhausted their retry budget.
+              if [ "${GIVEN_UP[$slug]}" = "1" ]; then
+                continue
+              fi
 
-### VULN-<NNN> — <Vulnerability Name>
+              # Skip sections that already produced a BEGIN marker.
+              if grep -q "BEGIN SECTION: $slug" "$REPORT_PARTS" 2>/dev/null; then
+                continue
+              fi
 
-- **CWE:** CWE-<id>
-- **OWASP Top 10:** <category, e.g. A01:2021 - Broken Access Control>
-- **Severity:** Critical | High | Medium | Low
-- **Affected File:** \`<repo-relative path>\`
-- **Affected Method / Class:** \`<name>\`
-- **Vulnerable Code:**
-  \`\`\`java
-  <verbatim snippet — copy-paste from the input>
-  \`\`\`
-- **Root Cause:** <one sentence>
-- **Exploitation Scenario:** <one paragraph>
-- **Business Impact:** <one paragraph>
-- **Confidence:** High | Medium | Low
+              missing_in_pass=$((missing_in_pass + 1))
+              echo "[pass $pass] calling section '$slug' (attempt $((${RETRY_COUNT[$slug]} + 1)))"
 
-Order findings Critical → High → Medium → Low. If a check category yields no findings, you may omit it. Do NOT include any other section in your reply — just the findings, one after another, in the schema above." \
-            "$REPORT_PARTS" "$SECTION_LOG" || exit 1
+              if do_one_section "$slug" \
+                                "$PROMPT_DIR/${slug}.txt" \
+                                "$REPORT_PARTS" \
+                                "$SECTION_LOG"; then
+                # Success — section is now in the report (the BEGIN
+                # marker is in place). Reset retry counter so a future
+                # failure won't immediately bail.
+                RETRY_COUNT["$slug"]=0
+              else
+                rc=$?
+                if [ "$rc" = "1" ]; then
+                  echo "::error::[$slug] hard failure; aborting run."
+                  exit 1
+                fi
+                # rc=2: empty block. Increment retry; if at cap, mark given-up.
+                RETRY_COUNT["$slug"]=$((${RETRY_COUNT[$slug]} + 1))
+                if [ "${RETRY_COUNT[$slug]}" -ge "$MAX_SECTION_RETRIES" ]; then
+                  echo "::warning::[$slug] exhausted $MAX_SECTION_RETRIES retries; giving up on this section."
+                  GIVEN_UP["$slug"]=1
+                fi
+              fi
+            done
 
-          # Section 4: OWASP Top 10 Mapping
-          do_one_section "OWASP Top 10 Mapping" \
-            "Produce ONLY the '# OWASP Top 10 Mapping' section: for each OWASP Top 10 2021 category that has at least one finding in this codebase, list the category name and the VULN-IDs that map to it. Use a Markdown table or a per-category sub-list. Categories with zero findings may be omitted. Do NOT include any other section." \
-            "$REPORT_PARTS" "$SECTION_LOG" || exit 1
+            # If every section is present, we're done.
+            remaining=0
+            for entry in "${SECTIONS[@]}"; do
+              slug="${entry##*|}"
+              if [ "${GIVEN_UP[$slug]}" = "1" ]; then
+                continue
+              fi
+              if ! grep -q "BEGIN SECTION: $slug" "$REPORT_PARTS" 2>/dev/null; then
+                remaining=$((remaining + 1))
+              fi
+            done
 
-          # Section 5: CWE Mapping
-          do_one_section "CWE Mapping" \
-            "Produce ONLY the '# CWE Mapping' section: for each CWE that has at least one finding, list the CWE ID + name and the VULN-IDs that map to it. Use a Markdown table. CWEs with zero findings may be omitted. Do NOT include any other section." \
-            "$REPORT_PARTS" "$SECTION_LOG" || exit 1
+            echo "[pass $pass] sections still missing: $remaining"
+            if [ "$remaining" = "0" ]; then
+              echo "[pass $pass] all sections present. Exiting completion loop."
+              break
+            fi
+            if [ "$missing_in_pass" = "0" ]; then
+              # Nothing to do this pass — shouldn't happen given the
+              # remaining>0 check above, but defensively break.
+              echo "[pass $pass] no progress; breaking loop."
+              break
+            fi
+          done
 
-          # Section 6: Priority Remediation Roadmap
-          do_one_section "Priority Remediation Roadmap" \
-            "Produce ONLY the '# Priority Remediation Roadmap' section: an ordered list (Critical → Low) of concrete remediation steps, one per VULN-ID, with a 1-3 sentence fix recommendation each. End with a '## Next Steps' sub-section listing the top 3 actions the developer should take first. Do NOT include any other section." \
-            "$REPORT_PARTS" "$SECTION_LOG" || exit 1
+          failed_sections=0
+          for entry in "${SECTIONS[@]}"; do
+            slug="${entry##*|}"
+            if [ "${GIVEN_UP[$slug]}" = "1" ]; then
+              echo "::error::[$slug] could not be generated after $MAX_SECTION_RETRIES retries."
+              failed_sections=$((failed_sections + 1))
+            fi
+          done
+          if [ "$failed_sections" -ne 0 ]; then
+            echo "::error::Refusing to assemble a partial assessment report."
+            exit 1
+          fi
 
           # ------------------------------------------------------------
-          # 4. Stitch the sections into the final report. Add a title
+          # 5. Stitch the sections into the final report. Add a title
           #    and a table of contents at the top so the report is
           #    self-contained.
           # ------------------------------------------------------------
@@ -468,22 +592,25 @@ Order findings Critical → High → Medium → Low. If a check category yields 
           echo "Report size: $REPORT_BYTES bytes"
           echo "Section transcript: $SECTION_LOG"
 
-          # Validate: must be non-empty and contain the sentinel.
+          # Validate: must be non-empty and contain every required heading.
           if [ "$REPORT_BYTES" -lt 200 ]; then
             echo "::error::Assessment report suspiciously small ($REPORT_BYTES bytes). Aborting."
             exit 1
           fi
-          if ! grep -q "# Executive Summary" "$ASSESSMENT_REPORT"; then
-            echo "::error::Assessment report missing # Executive Summary header."
-            echo "--- first 1000 chars ---"
-            head -c 1000 "$ASSESSMENT_REPORT"
-            echo
-            exit 1
-          fi
+          for expected_heading in \
+            "# Executive Summary" \
+            "# Risk Matrix" \
+            "# Vulnerability Findings" \
+            "# OWASP Top 10 Mapping" \
+            "# CWE Mapping" \
+            "# Priority Remediation Roadmap"; do
+            if ! grep -Fq "$expected_heading" "$ASSESSMENT_REPORT"; then
+              echo "::error::Assessment report missing required heading: $expected_heading"
+              exit 1
+            fi
+          done
 
-          # Also upload the section transcript for debugging — it
-          # contains the per-section transcripts, which makes
-          # diagnosing model behavior much easier.
+          # Save the per-section transcript for debugging.
           cp "$SECTION_LOG" .claude/reports/nvidia-scan-transcript.log || true
 
           echo "Wrote $ASSESSMENT_REPORT ($REPORT_BYTES bytes)."

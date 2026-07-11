@@ -57,7 +57,8 @@
       "Bash(mvn -B clean compile test-compile)",
       "Bash(mvn -B -o compile test-compile)",
       "Bash(mvn -B compile test-compile)",
-      "WebFetch(domain:claude.com)"
+      "WebFetch(domain:claude.com)",
+      "mcp__ide__getDiagnostics"
     ]
   }
 }
