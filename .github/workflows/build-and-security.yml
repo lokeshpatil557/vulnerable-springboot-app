@@ -238,8 +238,7 @@ jobs:
               # Anything that looks like a JSP/Thymeleaf template.
               find src -type f \
                 \( -name '*.html' -o -name '*.jsp' -o -name '*.tpl' \) 2>/dev/null || true
-              | sort -u
-            )
+            ) | sort -u
           } > "$USER_PAYLOAD"
 
           SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
