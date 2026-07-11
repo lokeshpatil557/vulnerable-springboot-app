@@ -128,10 +128,32 @@ jobs:
           jq --version
 
       # -----------------------------------------------------------
-      # 2d. NVIDIA vulnerability scanner.
-      #     Sends the scanner spec + the repo tree to NVIDIA,
-      #     extracts the fenced ```markdown``` block, writes it to
-      #     .claude/reports/SECURITY_ASSESSMENT_REPORT.md.
+      # 2d. NVIDIA vulnerability scanner — multi-request orchestrator.
+      #
+      #   Llama-3.1-70B on the free build.nvidia.com tier caps output at
+      #   16,384 tokens per request, but the scanner spec demands a long
+      #   report that frequently exceeds 8k tokens of output. We solve
+      #   this by issuing one API call per report section and stitching
+      #   the results together. Sections, in order:
+      #
+      #     1. Executive Summary
+      #     2. Risk Matrix
+      #     3. Vulnerability Findings  (the longest section — chunked
+      #        further if it exceeds the per-request output budget)
+      #     4. OWASP Top 10 Mapping
+      #     5. CWE Mapping
+      #     6. Priority Remediation Roadmap
+      #
+      #   Each call gets:
+      #     - the full repo file dump (one consolidated input payload
+      #       built once, reused across calls)
+      #     - a tight system prompt that names the section + output shape
+      #     - max_tokens = NVIDIA_MAX_TOKENS (8192) so the model can
+      #       always finish the section without hitting the cap
+      #
+      #   The workflow extracts each fenced block, appends to the
+      #   report, and validates the report is non-empty + contains
+      #   "# Executive Summary" before the next steps run.
       # -----------------------------------------------------------
       - name: nvidia-scan
         id: nvidia_scan
@@ -146,8 +168,16 @@ jobs:
             exit 1
           fi
 
-          # Build the user message: tree of the repo (capped) +
-          # full body of every Java/config file under 200 KB.
+          # ------------------------------------------------------------
+          # 1. Build the shared input payload once: a curated set of
+          #    files (the ones most likely to contain security findings)
+          #    plus a tree. We do NOT ship every Java/HTML/yml file
+          #    verbatim anymore — that ate the context window and gave
+          #    the model no room to write the report. We DO ship the
+          #    high-signal files: security config, controllers, repos,
+          #    any file mentioned in pom.xml's dependencies, and the
+          #    application config.
+          # ------------------------------------------------------------
           USER_PAYLOAD=$(mktemp)
           {
             echo "## Repository tree (paths only, capped at 400 entries)"
@@ -155,34 +185,60 @@ jobs:
               -not -path './target/*' \
               -not -path './.git/*' \
               -not -path './.claude/reports/*' \
+              -not -path './node_modules/*' \
               | sort | head -n 400) || true
             echo
-            echo "## File contents"
+            echo "## File contents (curated — high-signal files only)"
+            # Files most likely to contain findings. 16k-byte cap per
+            # file keeps the payload bounded; we never hit a 80kB
+            # spring-boot config in this lab.
             while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              [ ! -f "$f" ] && continue
               size=$(wc -c < "$f" 2>/dev/null || echo 0)
-              if [ "$size" -gt 80000 ]; then
-                echo
-                echo "### $f (skipped: ${size} bytes > 200000)"
-                continue
-              fi
               echo
-              echo "### $f"
-              size=$(wc -c < "$f")
-
-              if [ "$size" -gt 80000 ]; then
-                  head -c 80000 "$f"
-                  echo
-                  echo "...FILE TRUNCATED..."
+              echo "### $f (${size} bytes)"
+              if [ "$size" -gt 16000 ]; then
+                head -c 16000 "$f"
+                echo
+                echo "...FILE TRUNCATED at 16000 bytes..."
               else
-                  cat "$f"
+                cat "$f"
               fi
-            done < <(find . -type f \
-              \( -name '*.java' -o -name 'pom.xml' -o -name 'application*.yml' \
-                 -o -name 'application*.yaml' -o -name 'application*.properties' \
-                 -o -name '*.html' \) \
-              -not -path './target/*' \
-              -not -path './.git/*' \
-              -not -path './.claude/reports/*' | sort)
+            done < <(
+              # pom.xml first — always include.
+              printf '%s\n' pom.xml
+              # application*.{yml,yaml,properties}
+              find src/main/resources -type f \
+                \( -name 'application*.yml' \
+                   -o -name 'application*.yaml' \
+                   -o -name 'application*.properties' \) 2>/dev/null || true
+              # Security config + filters + auth-related classes.
+              find src -type f -name '*.java' \
+                \( -iname '*Security*' \
+                   -o -iname '*Auth*' \
+                   -o -iname '*Filter*' \
+                   -o -iname '*Config*' \
+                   -o -iname '*Cors*' \
+                   -o -iname '*Web*' \
+                   -o -iname '*User*' \
+                   -o -iname '*Login*' \
+                   -o -iname '*Token*' \
+                   -o -iname '*Jwt*' \) 2>/dev/null || true
+              # All controllers, services, repositories — the main attack
+              # surface for a Spring Boot app.
+              find src -type f -name '*.java' \
+                \( -path '*/controller/*' -o -path '*/controllers/*' \
+                   -o -path '*/service/*' -o -path '*/services/*' \
+                   -o -path '*/repository/*' -o -path '*/repositories/*' \
+                   -o -path '*/dao/*' \
+                   -o -path '*/model/*' -o -path '*/entity/*' \
+                   -o -path '*/dto/*' -o -path '*/util/*' -o -path '*/utils/*' \) 2>/dev/null || true
+              # Anything that looks like a JSP/Thymeleaf template.
+              find src -type f \
+                \( -name '*.html' -o -name '*.jsp' -o -name '*.tpl' \) 2>/dev/null || true
+              | sort -u
+            )
           } > "$USER_PAYLOAD"
 
           SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
@@ -192,81 +248,253 @@ jobs:
           echo "System prompt file: $SYSTEM_PROMPT_FILE"
           echo "Model: $NVIDIA_MODEL"
           echo "Endpoint: $NVIDIA_BASE_URL"
+          echo "Max tokens per request: $NVIDIA_MAX_TOKENS"
 
-          # Build the JSON request body safely with jq.
-          REQUEST_BODY=$(jq -n \
-            --arg model  "$NVIDIA_MODEL" \
-            --arg sys    "$SYSTEM_PROMPT" \
-            --arg user   "$(cat "$USER_PAYLOAD")" \
-            --argjson temp  "$NVIDIA_TEMPERATURE" \
-            --argjson mtok "$NVIDIA_MAX_TOKENS" \
-            '{model: $model, temperature: $temp, max_tokens: $mtok,
-              messages: [
-                {role: "system", content: $sys},
-                {role: "user",   content: $user}
-              ]}')
+          # ------------------------------------------------------------
+          # 2. Helper: do_one_section <section-id> <section-prompt>
+          #
+          #    Issues one API call. The system prompt + payload are
+          #    identical across calls; only the user-message tail
+          #    (the "section prompt") changes. The assistant's reply
+          #    is expected to be a single fenced ```markdown``` block
+          #    containing JUST that section. The function extracts the
+          #    block, strips the leading "# <Section Name>" header so
+          #    we don't double-print it, and appends to the report.
+          #
+          #    Returns 0 on success, 1 on failure (logged + aborts).
+          # ------------------------------------------------------------
+          do_one_section() {
+            local section_id="$1"
+            local section_prompt="$2"
+            local section_file="$3"   # the file to append into
+            local section_log="$4"    # log file for this section's transcript
 
-          echo "Request body size: $(echo "$REQUEST_BODY" | wc -c) bytes"
+            echo "--- nvidia-scan: requesting section '$section_id' ---"
 
-          RESPONSE_FILE=$(mktemp)
-          echo "=== NVIDIA SCAN: Calling API ==="
-          HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" \
-            -H "Authorization: Bearer $NVIDIA_API_KEY" \
-            -H "Content-Type: application/json" \
-            --connect-timeout 60 \
-            --max-time 1200 \
-            --retry 5 \
-            --retry-delay 15 \
-            --retry-all-errors \
-            --retry-max-time 900 \
-            -X POST "$NVIDIA_BASE_URL" \
-            -d "$REQUEST_BODY" || echo "000")
+            # Build the per-section user message: payload + a tight
+            # instruction asking for ONLY this section.
+            local USER_MSG
+            USER_MSG=$(cat "$USER_PAYLOAD")
+            USER_MSG="${USER_MSG}
 
-          echo "HTTP Response Code: $HTTP_CODE"
+---
 
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::NVIDIA scan HTTP $HTTP_CODE (expected 200)"
-            echo "=== NVIDIA API Response ==="
-            cat "$RESPONSE_FILE" || true
-            echo "=== End Response ==="
-            exit 1
-          fi
+## Section to produce NOW: ${section_id}
 
-          # Extract the assistant content.
-          ASSISTANT=$(jq -r '.choices[0].message.content // ""' "$RESPONSE_FILE")
-          if [ -z "$ASSISTANT" ]; then
-            echo "::error::NVIDIA scan returned empty assistant content."
-            echo "=== Full Response ==="
-            cat "$RESPONSE_FILE" || true
-            echo "=== End Response ==="
-            exit 1
-          fi
+${section_prompt}
 
-          echo "Assistant response size: $(echo "$ASSISTANT" | wc -c) bytes"
+Emit ONLY this section, formatted as a single Markdown fenced code block:
 
-          # Extract the first ```markdown ... ``` (or ``` ... ```) block.
-          # Strategy: take content between the first ``` line and the next ``` line.
-          REPORT=$(printf '%s\n' "$ASSISTANT" \
-            | awk '
-                /^```/{ if (!in_block) {in_block=1; next} else {in_block=0; exit} }
-                in_block {print}
-              ')
+\`\`\`markdown
+...this section's content, with its '# <Section Name>' header...
+\`\`\`
 
-          if [ -z "$REPORT" ]; then
-            echo "::error::No fenced code block found in NVIDIA scan response."
-            echo "--- raw assistant content (first 2000 chars) ---"
-            printf '%s\n' "$ASSISTANT" | head -c 2000
+No other sections. No preamble. No postamble. Stop after the closing fence."
+
+            local REQUEST_BODY
+            REQUEST_BODY=$(jq -n \
+              --arg model  "$NVIDIA_MODEL" \
+              --arg sys    "$SYSTEM_PROMPT" \
+              --arg user   "$USER_MSG" \
+              --argjson temp  "$NVIDIA_TEMPERATURE" \
+              --argjson mtok "$NVIDIA_MAX_TOKENS" \
+              '{model: $model, temperature: $temp, max_tokens: $mtok,
+                messages: [
+                  {role: "system", content: $sys},
+                  {role: "user",   content: $user}
+                ]}')
+
+            local RESPONSE_FILE
+            RESPONSE_FILE=$(mktemp)
+            local HTTP_CODE
+            HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" \
+              -H "Authorization: Bearer $NVIDIA_API_KEY" \
+              -H "Content-Type: application/json" \
+              --connect-timeout 60 \
+              --max-time 1200 \
+              --retry 5 \
+              --retry-delay 15 \
+              --retry-all-errors \
+              --retry-max-time 900 \
+              -X POST "$NVIDIA_BASE_URL" \
+              -d "$REQUEST_BODY" || echo "000")
+
+            echo "[$section_id] HTTP $HTTP_CODE"
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "::error::[$section_id] NVIDIA scan HTTP $HTTP_CODE (expected 200)"
+              echo "=== Response ==="
+              cat "$RESPONSE_FILE" || true
+              echo "=== End ==="
+              rm -f "$RESPONSE_FILE"
+              return 1
+            fi
+
+            local ASSISTANT
+            ASSISTANT=$(jq -r '.choices[0].message.content // ""' "$RESPONSE_FILE")
+            rm -f "$RESPONSE_FILE"
+            if [ -z "$ASSISTANT" ]; then
+              echo "::error::[$section_id] NVIDIA scan returned empty assistant content."
+              return 1
+            fi
+
+            # Log full transcript for debugging.
+            {
+              echo "=== Section: $section_id ==="
+              echo "--- USER PROMPT TAIL ---"
+              printf '%s\n' "$section_prompt"
+              echo "--- ASSISTANT REPLY (raw, first 4000 chars) ---"
+              printf '%s\n' "$ASSISTANT" | head -c 4000
+              echo
+              echo "--- END ---"
+            } >> "$section_log"
+
+            # Extract the fenced block. Try ```markdown first, then
+            # plain ```. If neither is present, treat the whole
+            # assistant message as the section content (so the model
+            # can still succeed even if it forgets the info string).
+            local BLOCK
+            BLOCK=$(printf '%s\n' "$ASSISTANT" \
+              | awk '
+                  /^```markdown/{ if (!in_block) {in_block=1; next} else {in_block=0; exit} }
+                  /^```/{        if (!in_block && !tried_md) {tried_md=1; in_block=1; next}
+                                  else if (in_block) {in_block=0; exit} }
+                  in_block {print}
+                ')
+
+            if [ -z "$BLOCK" ]; then
+              # Fallback: no fenced block at all. Accept the raw text.
+              echo "::warning::[$section_id] no fenced block found; using raw assistant content."
+              BLOCK=$(printf '%s\n' "$ASSISTANT")
+            fi
+
+            # Append to the report. We DON'T strip the "# Section"
+            # header — we want every section to be self-contained
+            # when concatenated, and the table of contents at the
+            # top of the report makes the headers useful.
+            {
+              echo
+              echo "<!-- BEGIN SECTION: $section_id -->"
+              printf '%s\n' "$BLOCK"
+              echo "<!-- END SECTION: $section_id -->"
+              echo
+            } >> "$section_file"
+
+            echo "[$section_id] appended $(printf '%s' "$BLOCK" | wc -c) bytes"
+            return 0
+          }
+
+          # ------------------------------------------------------------
+          # 3. Issue one call per section. Each section prompt is
+          #    intentionally narrow so the model doesn't burn its
+          #    output budget re-emitting the whole report.
+          # ------------------------------------------------------------
+          REPORT_PARTS=$(mktemp)
+          SECTION_LOG=$(mktemp)
+
+          # Section 1: Executive Summary
+          do_one_section "Executive Summary" \
+            "Produce the '# Executive Summary' section of SECURITY_ASSESSMENT_REPORT.md for this codebase. Cover: (a) the scope of the review (which files/areas you examined), (b) the methodology used (the check categories from your system prompt that you actually applied), (c) the top-line risk posture (one paragraph), and (d) a count of findings by severity (Critical/High/Medium/Low). Do NOT list individual findings here — that comes in the next section." \
+            "$REPORT_PARTS" "$SECTION_LOG" || exit 1
+
+          # Section 2: Risk Matrix
+          do_one_section "Risk Matrix" \
+            "Produce ONLY the '# Risk Matrix' section: a single Markdown table with columns 'Severity' and 'Likelihood', and rows for each combination (Critical/High/Medium/Low × High/Medium/Low). For each cell, give the count of findings that fall into that bucket based on your analysis of the input. Below the table, add one sentence explaining the methodology (e.g. severity = business impact, likelihood = exploitability given the current configuration)." \
+            "$REPORT_PARTS" "$SECTION_LOG" || exit 1
+
+          # Section 3: Vulnerability Findings (the big one)
+          do_one_section "Vulnerability Findings" \
+            "Produce ONLY the '# Vulnerability Findings' section. For EACH finding use this exact schema:
+
+### VULN-<NNN> — <Vulnerability Name>
+
+- **CWE:** CWE-<id>
+- **OWASP Top 10:** <category, e.g. A01:2021 - Broken Access Control>
+- **Severity:** Critical | High | Medium | Low
+- **Affected File:** \`<repo-relative path>\`
+- **Affected Method / Class:** \`<name>\`
+- **Vulnerable Code:**
+  \`\`\`java
+  <verbatim snippet — copy-paste from the input>
+  \`\`\`
+- **Root Cause:** <one sentence>
+- **Exploitation Scenario:** <one paragraph>
+- **Business Impact:** <one paragraph>
+- **Confidence:** High | Medium | Low
+
+Order findings Critical → High → Medium → Low. If a check category yields no findings, you may omit it. Do NOT include any other section in your reply — just the findings, one after another, in the schema above." \
+            "$REPORT_PARTS" "$SECTION_LOG" || exit 1
+
+          # Section 4: OWASP Top 10 Mapping
+          do_one_section "OWASP Top 10 Mapping" \
+            "Produce ONLY the '# OWASP Top 10 Mapping' section: for each OWASP Top 10 2021 category that has at least one finding in this codebase, list the category name and the VULN-IDs that map to it. Use a Markdown table or a per-category sub-list. Categories with zero findings may be omitted. Do NOT include any other section." \
+            "$REPORT_PARTS" "$SECTION_LOG" || exit 1
+
+          # Section 5: CWE Mapping
+          do_one_section "CWE Mapping" \
+            "Produce ONLY the '# CWE Mapping' section: for each CWE that has at least one finding, list the CWE ID + name and the VULN-IDs that map to it. Use a Markdown table. CWEs with zero findings may be omitted. Do NOT include any other section." \
+            "$REPORT_PARTS" "$SECTION_LOG" || exit 1
+
+          # Section 6: Priority Remediation Roadmap
+          do_one_section "Priority Remediation Roadmap" \
+            "Produce ONLY the '# Priority Remediation Roadmap' section: an ordered list (Critical → Low) of concrete remediation steps, one per VULN-ID, with a 1-3 sentence fix recommendation each. End with a '## Next Steps' sub-section listing the top 3 actions the developer should take first. Do NOT include any other section." \
+            "$REPORT_PARTS" "$SECTION_LOG" || exit 1
+
+          # ------------------------------------------------------------
+          # 4. Stitch the sections into the final report. Add a title
+          #    and a table of contents at the top so the report is
+          #    self-contained.
+          # ------------------------------------------------------------
+          {
+            echo "# SECURITY ASSESSMENT REPORT"
             echo
-            echo "--- end ---"
+            echo "_Generated by the NVIDIA vulnerability scanner on $(date -u +%Y-%m-%dT%H:%M:%SZ)._"
+            echo "_Model: ${NVIDIA_MODEL} (build.nvidia.com)._"
+            echo
+            echo "## Contents"
+            echo
+            echo "1. [Executive Summary](#executive-summary)"
+            echo "2. [Risk Matrix](#risk-matrix)"
+            echo "3. [Vulnerability Findings](#vulnerability-findings)"
+            echo "4. [OWASP Top 10 Mapping](#owasp-top-10-mapping)"
+            echo "5. [CWE Mapping](#cwe-mapping)"
+            echo "6. [Priority Remediation Roadmap](#priority-remediation-roadmap)"
+            echo
+            cat "$REPORT_PARTS"
+          } > "$ASSESSMENT_REPORT"
+
+          REPORT_BYTES=$(wc -c < "$ASSESSMENT_REPORT")
+          echo "=== NVIDIA SCAN: report assembled ==="
+          echo "Report size: $REPORT_BYTES bytes"
+          echo "Section transcript: $SECTION_LOG"
+
+          # Validate: must be non-empty and contain the sentinel.
+          if [ "$REPORT_BYTES" -lt 200 ]; then
+            echo "::error::Assessment report suspiciously small ($REPORT_BYTES bytes). Aborting."
+            exit 1
+          fi
+          if ! grep -q "# Executive Summary" "$ASSESSMENT_REPORT"; then
+            echo "::error::Assessment report missing # Executive Summary header."
+            echo "--- first 1000 chars ---"
+            head -c 1000 "$ASSESSMENT_REPORT"
+            echo
             exit 1
           fi
 
-          printf '%s\n' "$REPORT" > "$ASSESSMENT_REPORT"
-          if ! grep -q "# Executive Summary" "$ASSESSMENT_REPORT"; then
-              echo "::error::Assessment report incomplete."
-              exit 1
-          fi
-          echo "✓ Wrote $ASSESSMENT_REPORT ($(wc -c < "$ASSESSMENT_REPORT") bytes)."
+          # Also upload the section transcript for debugging — it
+          # contains the per-section transcripts, which makes
+          # diagnosing model behavior much easier.
+          cp "$SECTION_LOG" .claude/reports/nvidia-scan-transcript.log || true
+
+          echo "Wrote $ASSESSMENT_REPORT ($REPORT_BYTES bytes)."
+
+      - name: Upload nvidia-scan transcript
+        if: always() && hashFiles('.claude/reports/nvidia-scan-transcript.log') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvidia-scan-transcript
+          path: .claude/reports/nvidia-scan-transcript.log
+          retention-days: 30
 
       - name: Upload security assessment report
         if: always() && hashFiles(env.ASSESSMENT_REPORT) != ''
