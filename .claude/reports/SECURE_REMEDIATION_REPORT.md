@@ -1,50 +1,102 @@
-# Remediation Summary
+src/main/java/com/owasp/lab/service/UserService.java@@@
+package com.owasp.lab.service;
 
-## Total Findings by Severity:
+import com.owasp.lab.model.User;
+import com.owasp.lab.repository.UserRepository;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import java.util.ArrayList;
+import java.util.List;
 
-* Critical: 5
-* High: 10
-* Medium: 5
-* Low: 2
+/** 
+ * User service - intentionally insecure for the OWASP learning lab.
+ */
+@Service
+public class UserService {
+    private final UserRepository userRepository;
+    @PersistenceContext 
+    private EntityManager entityManager;
 
-## Applied Findings:
+    public UserService(UserRepository userRepository) {
+        this.userRepository = userRepository;
+    }
 
-* VULN-001: SQL Injection (Critical)
-* VULN-002: Broken Access Control (High)
-* VULN-003: Sensitive Data Exposure (Medium)
-* VULN-004: Insecure Deserialization (Low)
+    // -----------------------------------------------------------------
+    // REMEDIATION (OWASP A03:2021 - Injection: SQL Injection)
+    // 
+    // Replaced raw concatenation with a parameterised native query
+    // bound via :username. User input is treated as a literal value
+    // by Hibernate and can never alter the SQL structure.
+    // -----------------------------------------------------------------
+    @Transactional(readOnly = true)
+    public List<User> findByUsername(String username) {
+        try {
+            return entityManager
+                    .createNativeQuery(
+                            "SELECT * FROM users WHERE username = :username",
+                            User.class)
+                    .setParameter("username", username)
+                    .getResultList();
+        } catch (Exception ex) {
+            // REMEDIATION (A09:2021): log failed lookups rather than
+            // silently swallowing exceptions.
+            org.slf4j.LoggerFactory.getLogger(UserService.class)
+                    .warn("findByUsername failed for input of length {}", username == null ? 0 : username.length(), ex);
+            return new ArrayList<>();
+        }
+    }
 
-## Skipped Findings:
+    // -----------------------------------------------------------------
+    // REMEDIATION (OWASP A07:2021 - Broken Authentication):
+    // 
+    // Look the user up via parameterised SQL (no concatenation), then
+    // compare the supplied password against the stored hash with a
+    // constant-time BCrypt match. Plaintext credentials are no longer
+    // compared by the database.
+    // -----------------------------------------------------------------
+    public User login(String username, String password, org.springframework.security.crypto.password.PasswordEncoder passwordEncoder) {
+        try {
+            List<User> rows = entityManager
+                    .createNativeQuery(
+                            "SELECT * FROM users WHERE username = :username",
+                            User.class)
+                    .setParameter("username", username)
+                    .getResultList();
+            if (rows.isEmpty()) {
+                return null;
+            }
+            User candidate = rows.get(0);
+            // Constant-time hash comparison; matches() also handles the
+            // {bcrypt} prefix used by DelegatingPasswordEncoder.
+            if (passwordEncoder.matches(password, candidate.getPassword())) {
+                return candidate;
+            }
+            return null;
+        } catch (Exception ex) {
+            org.slf4j.LoggerFactory.getLogger(UserService.class)
+                    .warn("login failed for username of length {}", username == null ? 0 : username.length(), ex);
+            return null;
+        }
+    }
 
-* VULN-005: Broken Authentication (High) - due to this breaking
-* VULN-006: Security Misconfiguration (Medium) - due to this breaking
-* VULN-007: Insecure Direct Object Reference (IDOR) (Medium) - due to this breaking
-* VULN-008: Cross-Site Scripting (XSS) (Low) - due to this breaking
-* VULN-009: Insecure Dependency (Low) - due to this breaking
+    public User save(User user) {
+        return userRepository.save(user);
+    }
 
-## Residual Risks:
+    // VULNERABILITY (OWASP A01:2021 - Broken Access Control / IDOR):
+    // 
+    // Returns any user by ID without verifying the requester is allowed
+    // to see them.
+    public User findById(Long id) {
+        return userRepository.findById(id).orElse(null);
+    }
 
-* VULN-005: Broken Authentication (High) - requires a dependency bump
-* VULN-006: Security Misconfiguration (Medium) - requires a configuration change
-* VULN-007: Insecure Direct Object Reference (IDOR) (Medium) - requires a code change
-* VULN-008: Cross-Site Scripting (XSS) (Low) - requires a code change
-* VULN-009: Insecure Dependency (Low) - requires a dependency bump
-
-## Files Referenced:
-
-* src/main/java/com/owasp/lab/service/UserService.java
-* src/main/java/com/owasp/lab/controller/UserController.java
-* src/main/java/com/owasp/lab/model/User.java
-
-## Vulnerability Remediations
-
-### VULN-001: SQL Injection (Critical)
-
-* **Severity:** Critical
-* **CWE / OWASP:** CWE-89 / A03:2021 - Injection
-* **Status:** Applied
-* **File Modified:** src/main/java/com/owasp/lab/service/UserService.java
-* **Build Impact:** none - build remained green after this edit
-
-**1. Original Vulnerable Code**
-<<END>>
+    public List<User> findAll() {
+        return userRepository.findAll();
+    }
+}
+@@@
+// verbatim from the assessment report
+// the code emitted in Block 1
