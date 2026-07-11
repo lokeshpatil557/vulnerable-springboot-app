@@ -681,10 +681,10 @@ jobs:
 
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
+          git stash push -u -m "github-actions-temp"
           git checkout "$PARENT"
           git checkout -b "$NEW_BRANCH"
-
+          git stash pop || true
           # Re-stage on the new branch (working tree carries over, but be safe).
           git add -A
           git add -f "$ASSESSMENT_REPORT" "$REMEDIATION_REPORT" 2>/dev/null || true
