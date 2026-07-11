@@ -6,10 +6,10 @@ name: Build & Security (NVIDIA CI pipeline)
 on:
   push:
     branches:
-      - feature/nvidia-git-agent
+      - nvdia_trials
   pull_request:
     branches:
-      - feature/nvidia-git-agent
+      - nvdia_trials
   workflow_dispatch:
 
 # Workflow-wide defaults. Per-job permissions override these.
@@ -29,7 +29,7 @@ env:
   NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1/chat/completions
   NVIDIA_MODEL: meta/llama-3.1-70b-instruct
   NVIDIA_TEMPERATURE: "0.0"
-  NVIDIA_MAX_TOKENS: "8192"
+  NVIDIA_MAX_TOKENS: "4096"
 
 jobs:
   # ---------------------------------------------------------------
@@ -159,14 +159,22 @@ jobs:
             echo "## File contents"
             while IFS= read -r f; do
               size=$(wc -c < "$f" 2>/dev/null || echo 0)
-              if [ "$size" -gt 200000 ]; then
+              if [ "$size" -gt 80000 ]; then
                 echo
                 echo "### $f (skipped: ${size} bytes > 200000)"
                 continue
               fi
               echo
               echo "### $f"
-              cat "$f"
+              size=$(wc -c < "$f")
+
+              if [ "$size" -gt 80000 ]; then
+                  head -c 80000 "$f"
+                  echo
+                  echo "...FILE TRUNCATED..."
+              else
+                  cat "$f"
+              fi
             done < <(find . -type f \
               \( -name '*.java' -o -name 'pom.xml' -o -name 'application*.yml' \
                  -o -name 'application*.yaml' -o -name 'application*.properties' \
@@ -204,7 +212,12 @@ jobs:
           HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" \
             -H "Authorization: Bearer $NVIDIA_API_KEY" \
             -H "Content-Type: application/json" \
-            --max-time 600 \
+            --connect-timeout 60 \
+            --max-time 1200 \
+            --retry 5 \
+            --retry-delay 15 \
+            --retry-all-errors \
+            --retry-max-time 900 \
             -X POST "$NVIDIA_BASE_URL" \
             -d "$REQUEST_BODY" || echo "000")
 
@@ -248,6 +261,10 @@ jobs:
           fi
 
           printf '%s\n' "$REPORT" > "$ASSESSMENT_REPORT"
+          if ! grep -q "# Executive Summary" "$ASSESSMENT_REPORT"; then
+              echo "::error::Assessment report incomplete."
+              exit 1
+          fi
           echo "✓ Wrote $ASSESSMENT_REPORT ($(wc -c < "$ASSESSMENT_REPORT") bytes)."
 
       - name: Upload security assessment report
@@ -341,7 +358,12 @@ jobs:
           HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" \
             -H "Authorization: Bearer $NVIDIA_API_KEY" \
             -H "Content-Type: application/json" \
-            --max-time 600 \
+            --connect-timeout 60 \
+            --max-time 1200 \
+            --retry 5 \
+            --retry-delay 15 \
+            --retry-all-errors \
+            --retry-max-time 900 \
             -X POST "$NVIDIA_BASE_URL" \
             -d "$REQUEST_BODY" || echo "000")
 
@@ -395,6 +417,10 @@ jobs:
 
           # Always write the remediation report (it documents the run either way).
           printf '%s\n' "$REPORT_BODY" > "$REMEDIATION_REPORT"
+          if ! grep -q "# Remediation Summary" "$REMEDIATION_REPORT"; then
+              echo "::error::Remediation report incomplete."
+              exit 1
+          fi
           echo "✓ Wrote $REMEDIATION_REPORT ($(wc -c < "$REMEDIATION_REPORT") bytes)."
 
           # Apply patches if any. Patch file format: lines, with `@@@` on its
@@ -548,10 +574,10 @@ jobs:
 
       # -----------------------------------------------------------
       # 2f. NVIDIA push — creates a per-development-branch chain step.
-      #     Branch family: feature/nvidia-git-agent_<N>_<TIMESTAMP>.
+      #     Branch family: nvdia_trials_<N>_<TIMESTAMP>.
       #     The parent of push #N is the previous push #(N-1)'s tip
-      #     (i.e. the tip of feature/nvidia-git-agent_<MAX_N>_*), or
-      #     the development branch feature/nvidia-git-agent itself if
+      #     (i.e. the tip of nvdia_trials_<MAX_N>_*), or
+      #     the development branch nvdia_trials itself if
       #     no numbered push exists yet.
       #     The push step itself is model-free — the scan + remediate
       #     jobs are the only places the model is used.
@@ -561,9 +587,9 @@ jobs:
         env:
           # Family prefix for the chain steps created by this workflow.
           # Change this if the development branch is renamed.
-          CHAIN_PREFIX: feature/nvidia-git-agent
+          CHAIN_PREFIX: nvdia_trials
           # Development branch the chain hangs off (parent of push #1).
-          DEVELOPMENT_BRANCH: feature/nvidia-git-agent
+          DEVELOPMENT_BRANCH: nvdia_trials
         run: |
           set -euo pipefail
 
@@ -763,11 +789,11 @@ jobs:
           fi
 
           # Sanity: never push report updates to a chain step. The chain
-          # step is always `${CHAIN_PREFIX}_<N>_<TS>` (e.g. feature/nvidia-git-agent_1_…)
+          # step is always `${CHAIN_PREFIX}_<N>_<TS>` (e.g. nvdia_trials_1_…)
           # — we must not accidentally commit reports there. Reports
           # belong on the development branch (the trigger).
           case "$TRIGGER_BRANCH" in
-            feature/nvidia-git-agent_[0-9]*_*)
+            nvdia_trials_[0-9]*_*)
               echo "::error::Refusing to push report updates to a chain step branch: $TRIGGER_BRANCH"
               exit 1
               ;;
