@@ -1,5 +1,6 @@
-# Executive Summary
+# SECURITY_ASSESSMENT_REPORT.md
 
+<<<<<<< Updated upstream
 This report summarizes the findings of a comprehensive static application security review of the OWASP Vulnerability Lab, a Spring Boot application intentionally designed to contain security vulnerabilities. The review analyzed the entire codebase, including Java source files, configuration files, and dependencies.
 
 **Methodology**
@@ -7,9 +8,21 @@ This report summarizes the findings of a comprehensive static application securi
 The review was conducted using a combination of manual code analysis and automated tools. The analysis focused on identifying security vulnerabilities, insecure coding practices, and compliance issues.
 
 **Top-line Risk Posture**
+=======
+## Executive Summary
+
+This security assessment report covers the OWASP Top 10 (2021) Vulnerability Lab, a Spring Boot application intentionally designed to be insecure for educational purposes. The assessment methodology involved analyzing the application's source code, identifying vulnerabilities, and providing remediation guidance.
+
+**Scope:** The assessment focused on the entire Spring Boot codebase, including Java source files, configuration files, and templates.
+
+**Methodology:** The assessment involved manual code review, using a combination of static analysis and dynamic testing techniques to identify vulnerabilities.
+
+**Top-line Risk Posture:** The application is highly vulnerable, with multiple critical and high-severity findings.
+>>>>>>> Stashed changes
 
 The review identified a total of 17 security vulnerabilities, including:
 
+<<<<<<< Updated upstream
 * 5 Critical vulnerabilities
 * 6 High vulnerabilities
 * 4 Medium vulnerabilities
@@ -23,18 +36,34 @@ The review identified a total of 17 security vulnerabilities, including:
 | High | 6 |
 | Medium | 4 |
 | Low | 2 |
+=======
+* Critical: 5
+* High: 10
+* Medium: 5
+* Low: 2
+>>>>>>> Stashed changes
 
-# Risk Matrix
+## Risk Matrix
 
+<<<<<<< Updated upstream
 | Severity | Likelihood | Impact | Risk Score |
 | --- | --- | --- | --- |
 | Critical | High | High | 9 |
 | High | Medium | Medium | 6 |
 | Medium | Low | Low | 3 |
 | Low | Low | Low | 1 |
+=======
+| Severity | Likelihood | Impact | Count |
+| --- | --- | --- | --- |
+| Critical | High | High | 5 |
+| High | Medium | Medium | 10 |
+| Medium | Low | Low | 5 |
+| Low | Low | Low | 2 |
+>>>>>>> Stashed changes
 
-# Vulnerability Findings
+## Vulnerability Findings
 
+<<<<<<< Updated upstream
 ## VULN-001: SQL Injection (Critical)
 
 * **Vulnerability Name**: SQL Injection
@@ -137,3 +166,14 @@ The review identified a total of 17 security vulnerabilities, including:
 	* Priority: Low
 
 Note: The remediation roadmap is prioritized based on the severity and business impact of each vulnerability.
+=======
+### VULN-001: SQL Injection (Critical)
+
+* **Vulnerability Name:** SQL Injection
+* **CWE ID:** CWE-89
+* **OWASP Top 10 Category:** A03:2021 - Injection
+* **Severity:** Critical
+* **Affected File:** `src/main/java/com/owasp/lab/service/UserService.java`
+* **Affected Method/Class:** `findByUsernameUnsafe`
+* **Exact Vulnerable Code Snippet:**
+>>>>>>> Stashed changes
