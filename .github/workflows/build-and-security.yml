@@ -475,44 +475,64 @@ jobs:
               }
             '
             
-            # Read patch records from PATCH_QUEUE (path, then body, then separator)
+            # Read patch records from PATCH_QUEUE (path, then body, then separator).
+            # We accumulate the body into a temp file (one per record) so we
+            # never have to put a multi-line bash string in the YAML, and so
+            # big patches don't OOM shell string concatenation.
             CURRENT_PATH=""
-            CURRENT_BODY=""
+            CURRENT_BODY_FILE=""
             while IFS= read -r line; do
               if [ "$line" = "RECORD_SEPARATOR" ]; then
                 # Process the accumulated patch
                 if [ -n "$CURRENT_PATH" ]; then
                   # Trim whitespace
                   CURRENT_PATH=$(printf '%s' "$CURRENT_PATH" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                  
+
                   # Security: refuse paths that escape the repo or are absolute.
-                  if printf '%s' "$CURRENT_PATH" | grep -qE '^/|/\.\./|\.\./|/\.\.$'; then
+                  # A path component is ".." only when it appears bounded by
+                  # string start/end or by '/'. Substring matches like
+                  # "my..file.java" or "v1.0..2/Foo" are NOT escapes.
+                  if printf '%s' "$CURRENT_PATH" | grep -qE '(^|/)\.\.($|/)|^\.|//|^/|\\'; then
                     echo "::error::refusing unsafe patch path: $CURRENT_PATH"
+                    [ -n "$CURRENT_BODY_FILE" ] && rm -f "$CURRENT_BODY_FILE"
                     exit 1
                   fi
-                  
+
                   # Validate path format (alphanumeric, dots, slashes, hyphens, underscores)
                   if ! printf '%s' "$CURRENT_PATH" | grep -qE '^[a-zA-Z0-9._/-]+$'; then
                     echo "::warning::skipping suspicious patch path: $CURRENT_PATH"
+                    [ -n "$CURRENT_BODY_FILE" ] && rm -f "$CURRENT_BODY_FILE"
                     CURRENT_PATH=""
-                    CURRENT_BODY=""
+                    CURRENT_BODY_FILE=""
                     continue
                   fi
-                  
-                  # Write the file
+
+                  # Write the file. CURRENT_BODY_FILE may be empty if the
+                  # patch had no body lines, in which case write an empty
+                  # file (matches the old behavior).
                   mkdir -p "$(dirname "$CURRENT_PATH")"
-                  printf '%s\n' "$CURRENT_BODY" > "$CURRENT_PATH"
+                  if ! cp "${CURRENT_BODY_FILE:-/dev/null}" "$CURRENT_PATH"; then
+                    echo "::error::failed to write $CURRENT_PATH"
+                    [ -n "$CURRENT_BODY_FILE" ] && rm -f "$CURRENT_BODY_FILE"
+                    exit 1
+                  fi
+                  [ -n "$CURRENT_BODY_FILE" ] && rm -f "$CURRENT_BODY_FILE"
                   APPLIED=$((APPLIED+1))
-                  echo "✓ Patched $CURRENT_PATH"
+                  echo "Patched $CURRENT_PATH"
                 fi
                 CURRENT_PATH=""
-                CURRENT_BODY=""
+                CURRENT_BODY_FILE=""
               elif [ -z "$CURRENT_PATH" ]; then
                 # First line after separator (or start) is the path
                 CURRENT_PATH="$line"
               else
-                # All subsequent lines until RECORD_SEPARATOR are body
-                CURRENT_BODY="$(printf '%s\n%s' "$CURRENT_BODY" "$line")"
+                # Body line. Stream into a per-record temp file rather than
+                # concatenating in a shell variable (which is O(n^2) and
+                # forces the multi-line-string-in-YAML problem).
+                if [ -z "$CURRENT_BODY_FILE" ]; then
+                  CURRENT_BODY_FILE=$(mktemp)
+                fi
+                printf '%s\n' "$line" >> "$CURRENT_BODY_FILE"
               fi
             done < "$PATCH_QUEUE"
             
