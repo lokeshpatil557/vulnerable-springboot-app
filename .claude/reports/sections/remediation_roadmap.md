@@ -1,19 +1,21 @@
 # Priority Remediation Roadmap
 
-1. **VULN-001**: Update `findByUsernameUnsafe` method in `UserService` to use parameterized queries instead of string concatenation to prevent SQL injection attacks. Implement input validation and sanitization to ensure user input is safe. Update the method to use a secure password hashing algorithm like BCrypt.
+1. **VULN-001**: Update `UserService.findByUsernameUnsafe` to use a parameterized query instead of string concatenation to prevent SQL injection. Ensure that the `username` parameter is properly sanitized and validated before being used in the query. Implement input validation to prevent malicious input from reaching the database.
 
-2. **VULN-002**: Update `save` method in `CommentController` to use HTML escaping for user-controlled input to prevent XSS attacks. Implement input validation and sanitization to ensure user input is safe.
+2. **VULN-002**: Update `CommentController.save` to use a prepared statement with parameterized queries to prevent SQL injection. Ensure that user input is properly sanitized and validated before being used in the query.
 
-3. **VULN-003**: Update `transfer` method in `TransferController` to implement proper access control and authentication checks to prevent unauthorized access. Implement input validation and sanitization to ensure user input is safe.
+3. **VULN-003**: Implement proper access control in `TransferController.transfer` to prevent unauthorized access. Ensure that the `transfer` method checks the user's role and permissions before allowing the transfer.
 
-4. **VULN-004**: Update `application.properties` to use secure cryptographic practices, such as using a secure password hashing algorithm like BCrypt and storing sensitive data securely.
+4. **VULN-004**: Update `SecretConfig.apiKey` to use a secure method of storing and retrieving API keys, such as using environment variables or a secrets manager. Ensure that API keys are not hardcoded in the source code.
 
-5. **VULN-005**: Update `insecureFilterChain` method in `SecurityConfig` to implement proper security configurations, such as enabling CSRF protection and implementing secure authentication and authorization checks.
+5. **VULN-005**: Update `SecurityConfig.insecureFilterChain` to implement proper security configurations, such as enabling CSRF protection and configuring secure headers. Ensure that the security configuration is properly tested and validated.
 
-6. **VULN-006**: Update `greet` method in `GreetController` to use HTML escaping for user-controlled input to prevent XSS attacks. Implement input validation and sanitization to ensure user input is safe.
+6. **VULN-006**: Update `CommentController.greet` to use a secure method of handling user input, such as using a whitelist of allowed characters or sanitizing the input. Ensure that user input is properly validated and sanitized before being used in the response.
+
+7. **VULN-007**: Update `InsecureDeserializationController.deserialize` to use a secure method of deserializing user input, such as using a secure deserialization library or validating the input. Ensure that user input is properly validated and sanitized before being deserialized.
 
 ## Next Steps
 
-1. Implement a secure password hashing algorithm like BCrypt for all user passwords.
-2. Enable CSRF protection for all state-changing requests.
-3. Implement input validation and sanitization for all user-controlled input to prevent XSS and SQL injection attacks.
+1. **Implement input validation and sanitization**: Ensure that all user input is properly validated and sanitized before being used in the application.
+2. **Configure secure headers and CSRF protection**: Implement proper security configurations, such as enabling CSRF protection and configuring secure headers.
+3. **Use secure methods of storing and retrieving sensitive data**: Ensure that sensitive data, such as API keys and database credentials, are stored and retrieved securely using methods such as environment variables or a secrets manager.

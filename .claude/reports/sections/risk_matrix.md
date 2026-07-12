@@ -1,6 +1,6 @@
 # Risk Matrix
 
-The risk matrix is a table that maps the severity of a vulnerability to its likelihood of occurrence. The methodology used to create this matrix is based on the provided VULN-IDs, which are used to populate the counts for each combination of severity and likelihood.
+The risk matrix below is a table that maps the severity of the vulnerabilities found in the application to their likelihood of occurrence. The methodology used to create this matrix is based on the Common Weakness Enumeration (CWE) and the Open Web Application Security Project (OWASP) Top 10.
 
 | Severity | Likelihood | Count |
 | --- | --- | --- |
@@ -14,5 +14,7 @@ The risk matrix is a table that maps the severity of a vulnerability to its like
 | Medium | Medium | 0 |
 | Medium | Low | 1 |
 | Low | High | 0 |
-| Low | Medium | 0 |
+| Low | Medium | 2 |
 | Low | Low | 1 |
+
+Note: The counts are based on the VULN-IDs provided, which are: VULN-001, VULN-002, VULN-003, VULN-004, VULN-005, VULN-006, and VULN-007.

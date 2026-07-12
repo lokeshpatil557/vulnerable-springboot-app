@@ -6,3 +6,4 @@
 | A02:2021 - Cryptographic Failures | VULN-004 |
 | A03:2021 - Injection | VULN-001, VULN-002, VULN-006 |
 | A05:2021 - Security Misconfiguration | VULN-005 |
+| A08:2021 - Software and Data Integrity Failures | VULN-007 |
