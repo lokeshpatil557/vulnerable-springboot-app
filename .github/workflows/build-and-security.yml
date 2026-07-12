@@ -54,6 +54,7 @@ jobs:
       contents: write
     env:
       REPORTS_DIR: .claude/reports
+      SECTIONS_DIR: .claude/reports/sections
       ASSESSMENT_REPORT: .claude/reports/SECURITY_ASSESSMENT_REPORT.md
       PUSH_REPORT: .claude/reports/GIT_PUSH_REPORT.md
 
@@ -71,7 +72,7 @@ jobs:
           cache: maven
 
       - name: Ensure reports dir exists
-        run: mkdir -p "$REPORTS_DIR"
+        run: mkdir -p "$REPORTS_DIR" "$SECTIONS_DIR"
 
       - name: Gitleaks secret scan
         uses: gitleaks/gitleaks-action@v2
@@ -87,38 +88,29 @@ jobs:
           jq --version
 
       # -----------------------------------------------------------
-      # NVIDIA vulnerability scanner — chained, validated orchestrator.
+      # NVIDIA vulnerability scanner — six isolated API requests.
       #
-      #   Generation order (NOT the same as display order):
-      #     1. Vulnerability Findings   — generated FIRST, no deps.
-      #        This is the only section allowed to invent VULN-IDs.
-      #     2. Parse real IDs           — local awk/grep on (1)'s
-      #        output. NOT an API call. Produces PARSED_LIST (a few
-      #        lines: ID | CWE | OWASP category | severity) and
-      #        severity counts.
-      #     3. Risk Matrix, OWASP Mapping, CWE Mapping, Remediation
-      #        Roadmap — each generated with PARSED_LIST injected
-      #        into the prompt. Output is validated: any VULN-ID it
-      #        references that isn't in PARSED_LIST triggers a
-      #        rejection + retry with feedback.
-      #     4. Executive Summary        — generated LAST, given the
-      #        real severity counts computed from PARSED_LIST (not
-      #        asked of the model), so its numbers match Findings.
+      #   Each request produces ONE section → saved to its own file:
+      #     vulnerability_findings.md  (Request 1 — source of truth)
+      #     risk_matrix.md             (Request 2)
+      #     owasp_mapping.md           (Request 3)
+      #     cwe_mapping.md             (Request 4)
+      #     remediation_roadmap.md     (Request 5)
+      #     executive_summary.md       (Request 6 — uses parsed counts)
       #
-      #   Every section call also gets:
-      #     - finish_reason check (truncation ("length") is never
-      #       accepted; the model is asked to continue, not restart)
-      #     - strict ~~~~markdown fence extraction (a missing/broken
-      #       fence is a retryable failure, never a raw-text fallback)
-      #     - cross-section leakage check (rejects a block containing
-      #       another section's "# Heading")
-      #     - retries carry a failure_note describing what was wrong,
-      #       and nudge temperature up slightly, so a retry at
-      #       temp=0 isn't just a repeat of the same broken output
+      #   Findings are generated first so later sections reference real
+      #   VULN-IDs. Executive Summary is generated last so severity
+      #   counts match the parsed findings list.
       #
-      #   Final stitching still uses the ORIGINAL display order:
-      #   Executive Summary → Risk Matrix → Vulnerability Findings →
-      #   OWASP Mapping → CWE Mapping → Remediation Roadmap.
+      #   After all six files exist, they are stitched (display order)
+      #   into SECURITY_ASSESSMENT_REPORT.md.
+      #
+      #   Validation per section:
+      #     - ~~~~markdown fence extraction (strict)
+      #     - cross-section heading leakage check
+      #     - duplicate VULN-ID rejection (findings + dependent sections)
+      #     - unknown VULN-ID rejection (dependent sections)
+      #     - dedupe pass on findings before save
       # -----------------------------------------------------------
       - name: nvidia-scan
         id: nvidia_scan
@@ -243,6 +235,31 @@ jobs:
             printf '%s' "$raw"
           }
 
+          # Keep only the first ### VULN-NNN block for each ID (continuation retries
+          # sometimes repeat findings).
+          dedupe_vuln_blocks() {
+            awk '
+              /^### VULN-[0-9]+/ {
+                match($0, /VULN-[0-9]+/)
+                vid = substr($0, RSTART, RLENGTH)
+                if (vid in seen) { skip = 1; next }
+                seen[vid] = 1
+                skip = 0
+              }
+              !skip { print }
+            '
+          }
+
+          duplicate_vuln_ids() {
+            printf '%s' "$1" | grep -oE 'VULN-[0-9]+' | sort | uniq -d
+          }
+
+          save_section_file() {
+            local slug="$1" content="$2"
+            printf '%s\n' "$content" > "$SECTIONS_DIR/${slug}.md"
+            echo "[$slug] saved → $SECTIONS_DIR/${slug}.md ($(printf '%s' "$content" | wc -c) bytes)"
+          }
+
           contains_other_heading() {
             local block="$1" own="$2"; shift 2
             for h in "$@"; do
@@ -325,6 +342,9 @@ jobs:
 
           ${failure_note}
 
+          Emit ONLY the '${own_heading}' section — no other report sections.
+          Do NOT repeat VULN-IDs already written. Do NOT output the full report.
+
           Emit ONLY this section, formatted as a single Markdown fenced code block.
           Use exactly four tilde characters for the OUTER fence:
 
@@ -402,6 +422,19 @@ jobs:
                 continue
               fi
 
+              if [ "$section_id" = "vulnerability_findings" ]; then
+                BLOCK=$(printf '%s' "$BLOCK" | dedupe_vuln_blocks)
+              fi
+
+              local DUP_IDS
+              DUP_IDS=$(duplicate_vuln_ids "$BLOCK" || true)
+              if [ -n "$DUP_IDS" ]; then
+                echo "::warning::[$section_id] duplicate VULN-IDs: $(printf '%s' "$DUP_IDS" | tr '\n' ' ')"
+                failure_note="NOTE: you listed the same VULN-ID more than once ($(printf '%s' "$DUP_IDS" | tr '\n' ' ')). Each VULN-ID must appear exactly once in this section."
+                temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
+                continue
+              fi
+
               # Grounding check — only applies when we gave the model a
               # PARSED_LIST to work from (i.e. not the Findings section itself).
               if [ -n "$extra_context" ] && [ -n "${PARSED_IDS:-}" ]; then
@@ -433,6 +466,7 @@ jobs:
                 echo
               } >> "$report_file"
 
+              save_section_file "$section_id" "$BLOCK"
               GENERATED_BLOCK="$BLOCK"
               echo "[$section_id] OK — appended $(printf '%s' "$BLOCK" | wc -c) bytes on attempt $attempt"
               return 0
@@ -450,6 +484,10 @@ jobs:
             fi
             FALLBACK=$(printf '%s' "$FALLBACK" | tr -d '\000')
 
+            if [ "$section_id" = "vulnerability_findings" ] && [ -n "$FALLBACK" ]; then
+              FALLBACK=$(printf '%s' "$FALLBACK" | dedupe_vuln_blocks)
+            fi
+
             if ! printf '%s' "$FALLBACK" | grep -q "^# ${own_heading}"; then
               FALLBACK="# ${own_heading}
 
@@ -466,6 +504,7 @@ jobs:
               echo
             } >> "$report_file"
 
+            save_section_file "$section_id" "$FALLBACK"
             echo "$section_id" >> "$DEGRADED_LOG"
             GENERATED_BLOCK="$FALLBACK"
             echo "[$section_id] DEGRADED — appended $(printf '%s' "$FALLBACK" | wc -c) fallback bytes"
@@ -534,18 +573,20 @@ jobs:
           DEGRADED_LOG=$(mktemp)
 
           # ------------------------------------------------------------
-          # 5. GENERATION ORDER (differs from display order):
-          #    Findings -> parse -> {Risk Matrix, OWASP, CWE, Roadmap}
-          #    -> Executive Summary (last, uses real counts).
+          # 5. Six API requests (generation order ≠ display order).
+          #    Each response → $SECTIONS_DIR/<slug>.md
           # ------------------------------------------------------------
 
-          echo "=== Step 1/3: Vulnerability Findings (source of truth) ==="
+          REQUEST_NUM=0
+          next_request() { REQUEST_NUM=$((REQUEST_NUM + 1)); echo "=== API Request ${REQUEST_NUM}/6: $1 → $SECTIONS_DIR/$2.md ==="; }
+
+          next_request "Vulnerability Findings (source of truth)" "vulnerability_findings"
           generate_section "vulnerability_findings" "$PROMPT_DIR/vulnerability_findings.txt" \
                             "$REPORT_PARTS" "$SECTION_LOG" \
                             "Vulnerability Findings" "$ALL_HEADINGS_CSV" ""
           FINDINGS_BLOCK="$GENERATED_BLOCK"
 
-          echo "=== Step 2/3: Parsing real IDs (local, no API call) ==="
+          echo "=== Parse real VULN-IDs (local, no API call) ==="
           PARSED_LIST=$(printf '%s\n' "$FINDINGS_BLOCK" | awk '
             /^### VULN-[0-9]+/      { id=$2; sub(/^VULN-/,"",id); vid="VULN-"id }
             /\*\*CWE:\*\*/          { cwe=$0; sub(/.*\*\*CWE:\*\* */,"",cwe) }
@@ -565,10 +606,11 @@ jobs:
 
           ${PARSED_LIST}"
 
-          echo "=== Step 3/3: Dependent sections (grounded on parsed list) ==="
+          echo "=== API Requests 2–5: sections grounded on parsed list ==="
           for entry in "Risk Matrix|risk_matrix" "OWASP Top 10 Mapping|owasp_mapping" \
                        "CWE Mapping|cwe_mapping" "Priority Remediation Roadmap|remediation_roadmap"; do
             heading="${entry%%|*}"; slug="${entry##*|}"
+            next_request "$heading" "$slug"
             generate_section "$slug" "$PROMPT_DIR/${slug}.txt" "$REPORT_PARTS" "$SECTION_LOG" \
                               "$heading" "$ALL_HEADINGS_CSV" "$MAPPING_CONTEXT"
           done
@@ -577,6 +619,7 @@ jobs:
           Critical: ${CRIT} | High: ${HIGH} | Medium: ${MED} | Low: ${LOW}
           Total findings: $(printf '%s\n' "$PARSED_IDS" | grep -c . || echo 0)"
 
+          next_request "Executive Summary" "executive_summary"
           generate_section "executive_summary" "$PROMPT_DIR/executive_summary.txt" "$REPORT_PARTS" "$SECTION_LOG" \
                             "Executive Summary" "$ALL_HEADINGS_CSV" "$SUMMARY_CONTEXT"
 
@@ -589,7 +632,8 @@ jobs:
           fi
 
           # ------------------------------------------------------------
-          # 6. Stitch in ORIGINAL DISPLAY ORDER (unchanged from before).
+          # 6. Combine six section files → SECURITY_ASSESSMENT_REPORT.md
+          #    (display order, not generation order)
           # ------------------------------------------------------------
           {
             echo "# SECURITY ASSESSMENT REPORT"
@@ -609,11 +653,18 @@ jobs:
 
             for entry in "${SECTIONS_DISPLAY_ORDER[@]}"; do
               slug="${entry##*|}"
-              awk -v marker="BEGIN SECTION: $slug" '
-                $0 ~ marker {flag=1; next}
-                /END SECTION:/ {flag=0}
-                flag {print}
-              ' "$REPORT_PARTS"
+              section_path="$SECTIONS_DIR/${slug}.md"
+              if [ -s "$section_path" ]; then
+                cat "$section_path"
+                echo
+              else
+                echo "::warning::Section file missing or empty: $section_path — falling back to stitched buffer." >&2
+                awk -v marker="BEGIN SECTION: $slug" '
+                  $0 ~ marker {flag=1; next}
+                  /END SECTION:/ {flag=0}
+                  flag {print}
+                ' "$REPORT_PARTS"
+              fi
             done
           } > "$ASSESSMENT_REPORT"
 
@@ -650,6 +701,14 @@ jobs:
           path: .claude/reports/nvidia-scan-transcript.log
           retention-days: 30
 
+      - name: Upload section files
+        if: always() && hashFiles('.claude/reports/sections/*.md') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-assessment-sections
+          path: .claude/reports/sections/
+          retention-days: 90
+
       - name: Upload security assessment report
         if: always() && hashFiles(env.ASSESSMENT_REPORT) != ''
         uses: actions/upload-artifact@v4
@@ -663,6 +722,7 @@ jobs:
           set -euo pipefail
           git add -A
           git add -f "$ASSESSMENT_REPORT" 2>/dev/null || true
+          git add -f "$SECTIONS_DIR"/*.md 2>/dev/null || true
           git status --short
           echo "---"
           git diff --cached --stat | tail -n 20
@@ -757,6 +817,7 @@ jobs:
           git stash pop || true
           git add -A
           git add -f "$ASSESSMENT_REPORT" 2>/dev/null || true
+          git add -f "$SECTIONS_DIR"/*.md 2>/dev/null || true
 
           MSG_FILE=$(mktemp)
           printf '%s' "$COMMIT_MSG" > "$MSG_FILE"
@@ -832,6 +893,7 @@ jobs:
           git checkout "$TRIGGER_BRANCH"
 
           git add -f "$ASSESSMENT_REPORT"
+          git add -f "$SECTIONS_DIR"/*.md 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No report changes to commit on $TRIGGER_BRANCH."
           else

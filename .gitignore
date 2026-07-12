@@ -22,4 +22,6 @@ HELP.md
 .claude/reports/*
 !.claude/reports/SECURITY_ASSESSMENT_REPORT.md
 !.claude/reports/SECURE_REMEDIATION_REPORT.md
+!.claude/reports/sections/
+!.claude/reports/sections/*.md
 !.claude/reports/.gitkeep
