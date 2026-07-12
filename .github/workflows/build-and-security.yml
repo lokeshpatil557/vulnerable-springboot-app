@@ -16,7 +16,7 @@ env:
   NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1/chat/completions
   NVIDIA_MODEL: meta/llama-3.1-70b-instruct
   NVIDIA_TEMPERATURE: "0.0"
-  NVIDIA_MAX_TOKENS: "8192"
+  NVIDIA_MAX_TOKENS: "12000"
 
 jobs:
   build:
