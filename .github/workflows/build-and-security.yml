@@ -1,8 +1,5 @@
 name: Build & Security (NVIDIA CI pipeline)
 
-# Trigger only on the development branch while the pipeline is being built.
-# Once the pipeline stabilises, broaden to feature/safe-backup* + master
-# so every chain step is cut from the previous tip.
 on:
   push:
     branches:
@@ -12,29 +9,16 @@ on:
       - nvdia_trials
   workflow_dispatch:
 
-# Workflow-wide defaults. Per-job permissions override these.
 permissions:
   contents: write
 
-# ---- NVIDIA endpoint configuration ----
-# To use a different model, change NVIDIA_MODEL below. Common
-# build.nvidia.com slugs (any of these will work as long as your
-# NVIDIA_API_KEY has access to them):
-#   meta/llama-3.1-70b-instruct
-#   mistralai/mistral-large-2-instruct
-#   nvidia/nemotron-4-340b-instruct
-# To use a different endpoint (e.g. self-hosted NIM), change
-# NVIDIA_BASE_URL below.
 env:
   NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1/chat/completions
   NVIDIA_MODEL: meta/llama-3.1-70b-instruct
   NVIDIA_TEMPERATURE: "0.0"
-  NVIDIA_MAX_TOKENS: "12000"
+  NVIDIA_MAX_TOKENS: "8192"
 
 jobs:
-  # ---------------------------------------------------------------
-  # 1. Build — unchanged from the previous workflow.
-  # ---------------------------------------------------------------
   build:
     name: Build (Maven)
     runs-on: ubuntu-latest
@@ -62,10 +46,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # ---------------------------------------------------------------
-  # 2. Security — three NVIDIA-driven agents + gitleaks.
-  #    Gated on build green.
-  # ---------------------------------------------------------------
   security:
     name: Security
     runs-on: ubuntu-latest
@@ -73,23 +53,11 @@ jobs:
     permissions:
       contents: write
     env:
-      # Make the .claude/reports dir exist before any job runs
-      # (the dir is gitignored, the assessment report is tracked).
-      # Remediation agent removed: only the assessment report and the
-      # git-push report are produced now.
       REPORTS_DIR: .claude/reports
       ASSESSMENT_REPORT: .claude/reports/SECURITY_ASSESSMENT_REPORT.md
       PUSH_REPORT: .claude/reports/GIT_PUSH_REPORT.md
 
     steps:
-      # -----------------------------------------------------------
-      # 2a. Checkout the source so the agents have something to scan.
-      #     fetch-depth: 0 is required so gitleaks-action@v2 can resolve
-      #     the rev-walk it builds on push events (it references the
-      #     parent of the merge base — e.g. c016eee2bc...^ — which a
-      #     shallow clone does not have). Without this the scan fails
-      #     with: fatal: unknown revision or path not in the working tree.
-      # -----------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -105,20 +73,11 @@ jobs:
       - name: Ensure reports dir exists
         run: mkdir -p "$REPORTS_DIR"
 
-      # -----------------------------------------------------------
-      # 2b. Secret scanning — unchanged.
-      # -----------------------------------------------------------
       - name: Gitleaks secret scan
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # -----------------------------------------------------------
-      # 2c. Helper — POST a system + user message to NVIDIA and
-      #     print the assistant's reply to stdout. Defined once, used
-      #     by all three agent jobs. Reads NVIDIA_API_KEY from the
-      #     repo secret.
-      # -----------------------------------------------------------
       - name: Install curl + jq (already on ubuntu-latest, but be explicit)
         run: |
           set -euo pipefail
@@ -128,57 +87,58 @@ jobs:
           jq --version
 
       # -----------------------------------------------------------
-      # 2d. NVIDIA vulnerability scanner — multi-request orchestrator.
+      # NVIDIA vulnerability scanner — chained, validated orchestrator.
       #
-      #   Llama-3.1-70B on the free build.nvidia.com tier caps output at
-      #   16,384 tokens per request, but the scanner spec demands a long
-      #   report that frequently exceeds 8k tokens of output. We solve
-      #   this by issuing one API call per report section, then running
-      #   a "completion loop": after the first pass, we check which
-      #   sections are missing and re-call them — up to MAX_PASSES
-      #   total passes — until the report has all six sections or the
-      #   workflow fails. This satisfies the requirement that the scanner
-      #   keep calling the model until a full report is produced.
+      #   Generation order (NOT the same as display order):
+      #     1. Vulnerability Findings   — generated FIRST, no deps.
+      #        This is the only section allowed to invent VULN-IDs.
+      #     2. Parse real IDs           — local awk/grep on (1)'s
+      #        output. NOT an API call. Produces PARSED_LIST (a few
+      #        lines: ID | CWE | OWASP category | severity) and
+      #        severity counts.
+      #     3. Risk Matrix, OWASP Mapping, CWE Mapping, Remediation
+      #        Roadmap — each generated with PARSED_LIST injected
+      #        into the prompt. Output is validated: any VULN-ID it
+      #        references that isn't in PARSED_LIST triggers a
+      #        rejection + retry with feedback.
+      #     4. Executive Summary        — generated LAST, given the
+      #        real severity counts computed from PARSED_LIST (not
+      #        asked of the model), so its numbers match Findings.
       #
-      #   Sections, in order:
-      #     1. Executive Summary
-      #     2. Risk Matrix
-      #     3. Vulnerability Findings  (longest — most likely to be
-      #        re-called if it comes back empty)
-      #     4. OWASP Top 10 Mapping
-      #     5. CWE Mapping
-      #     6. Priority Remediation Roadmap
+      #   Every section call also gets:
+      #     - finish_reason check (truncation ("length") is never
+      #       accepted; the model is asked to continue, not restart)
+      #     - strict ~~~~markdown fence extraction (a missing/broken
+      #       fence is a retryable failure, never a raw-text fallback)
+      #     - cross-section leakage check (rejects a block containing
+      #       another section's "# Heading")
+      #     - retries carry a failure_note describing what was wrong,
+      #       and nudge temperature up slightly, so a retry at
+      #       temp=0 isn't just a repeat of the same broken output
+      #
+      #   Final stitching still uses the ORIGINAL display order:
+      #   Executive Summary → Risk Matrix → Vulnerability Findings →
+      #   OWASP Mapping → CWE Mapping → Remediation Roadmap.
       # -----------------------------------------------------------
       - name: nvidia-scan
         id: nvidia_scan
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           SYSTEM_PROMPT_FILE: .claude/agents/nvidia-vulnerability-scanner.md
-          # How many outer passes to attempt. Each pass issues up to
-          # six section calls, but only for sections that are still
-          # missing from the report. Hard cap so we don't loop forever
-          # if the model is broken.
-          MAX_PASSES: "4"
-          # Per-call retry budget. A section is re-called (with the
-          # same prompt) if the API returned 0 bytes or the fenced
-          # block couldn't be extracted.
-          MAX_SECTION_RETRIES: "2"
+          MAX_SECTION_RETRIES: "3"
+          MAX_CONTINUATIONS: "3"
+          MIN_SECTION_WORDS: "15"
         run: |
           set -euo pipefail
           if [ -z "${NVIDIA_API_KEY:-}" ]; then
             echo "::error::NVIDIA_API_KEY repository secret is not set."
-            echo "Please add NVIDIA_API_KEY to your repository secrets."
             exit 1
           fi
 
           # ------------------------------------------------------------
-          # 1. Build the shared input payload once: a curated set of
-          #    files (the ones most likely to contain security findings)
-          #    plus a tree. We do NOT ship every Java/HTML/yml file
-          #    verbatim — that ate the context window and gave the
-          #    model no room to write the report. We DO ship the
-          #    high-signal files: security config, controllers, repos,
-          #    pom.xml, and the application config.
+          # 1. Shared input payload — curated high-signal files, same
+          #    approach as before (pom.xml, security/config classes,
+          #    controllers/services/repos, templates), capped per file.
           # ------------------------------------------------------------
           USER_PAYLOAD=$(mktemp)
           {
@@ -191,8 +151,6 @@ jobs:
               | sort | head -n 400) || true
             echo
             echo "## File contents (curated — high-signal files only)"
-            # Files most likely to contain findings. 16k-byte cap per
-            # file keeps the payload bounded.
             while IFS= read -r f; do
               [ -z "$f" ] && continue
               [ ! -f "$f" ] && continue
@@ -207,35 +165,22 @@ jobs:
                 cat "$f"
               fi
             done < <(
-              # pom.xml first — always include.
               printf '%s\n' pom.xml
-              # application*.{yml,yaml,properties}
               find src/main/resources -type f \
                 \( -name 'application*.yml' \
                    -o -name 'application*.yaml' \
                    -o -name 'application*.properties' \) 2>/dev/null || true
-              # Security config + filters + auth-related classes.
               find src -type f -name '*.java' \
-                \( -iname '*Security*' \
-                   -o -iname '*Auth*' \
-                   -o -iname '*Filter*' \
-                   -o -iname '*Config*' \
-                   -o -iname '*Cors*' \
-                   -o -iname '*Web*' \
-                   -o -iname '*User*' \
-                   -o -iname '*Login*' \
-                   -o -iname '*Token*' \
+                \( -iname '*Security*' -o -iname '*Auth*' -o -iname '*Filter*' \
+                   -o -iname '*Config*' -o -iname '*Cors*' -o -iname '*Web*' \
+                   -o -iname '*User*' -o -iname '*Login*' -o -iname '*Token*' \
                    -o -iname '*Jwt*' \) 2>/dev/null || true
-              # All controllers, services, repositories — the main
-              # attack surface for a Spring Boot app.
               find src -type f -name '*.java' \
                 \( -path '*/controller/*' -o -path '*/controllers/*' \
                    -o -path '*/service/*' -o -path '*/services/*' \
                    -o -path '*/repository/*' -o -path '*/repositories/*' \
-                   -o -path '*/dao/*' \
-                   -o -path '*/model/*' -o -path '*/entity/*' \
+                   -o -path '*/dao/*' -o -path '*/model/*' -o -path '*/entity/*' \
                    -o -path '*/dto/*' -o -path '*/util/*' -o -path '*/utils/*' \) 2>/dev/null || true
-              # Anything that looks like a JSP/Thymeleaf template.
               find src -type f \
                 \( -name '*.html' -o -name '*.jsp' -o -name '*.tpl' \) 2>/dev/null || true
             ) | sort -u
@@ -245,52 +190,91 @@ jobs:
 
           echo "=== NVIDIA SCAN: Preparing request ==="
           echo "Payload size: $(wc -c < "$USER_PAYLOAD") bytes"
-          echo "System prompt file: $SYSTEM_PROMPT_FILE"
           echo "Model: $NVIDIA_MODEL"
-          echo "Endpoint: $NVIDIA_BASE_URL"
-          echo "Max tokens per request: $NVIDIA_MAX_TOKENS"
-          echo "Max outer passes: $MAX_PASSES"
-          echo "Max per-section retries: $MAX_SECTION_RETRIES"
 
           # ------------------------------------------------------------
-          # 2. do_one_section <section-id> <section-prompt-file>
-          #
-          #    Issues one API call. The system prompt + payload are
-          #    identical across calls; only the user-message tail
-          #    (the "section prompt") changes. The assistant's reply
-          #    is expected to be a single fenced ~~~~markdown block
-          #    containing JUST that section. The function extracts the
-          #    block and appends it to the report.
-          #
-          #    Returns 0 on success, 1 on a hard failure. If the call
-          #    itself succeeded but the fenced block came back empty,
-          #    returns 2 — caller (the section retry loop) decides
-          #    whether to retry.
+          # 2. Helper: strict fence extraction. Only matched
+          #    ~~~~markdown ... ~~~~ fences are accepted. No fallback.
           # ------------------------------------------------------------
-          do_one_section() {
-            local section_id="$1"
-            local section_prompt_file="$2"   # file holding the per-section prompt
-            local section_file="$3"          # report parts file to append into
-            local section_log="$4"           # transcript log
+          extract_block() {
+            awk '
+              /^~~~~[Mm]arkdown[[:space:]]*$/ { if (!in_block) {in_block=1; found=1; next} }
+              /^~~~~[[:space:]]*$/            { if (in_block) {in_block=0; exit} }
+              in_block { print }
+              END { if (!found) exit 1 }
+            '
+          }
 
-            echo "--- nvidia-scan: requesting section '$section_id' ---"
+          contains_other_heading() {
+            local block="$1" own="$2"; shift 2
+            for h in "$@"; do
+              [ "$h" = "$own" ] && continue
+              if printf '%s\n' "$block" | grep -q "^# ${h}"; then
+                return 0
+              fi
+            done
+            return 1
+          }
 
-            # Build the per-section user message via a heredoc. This
-            # is the critical fix: previously the message was built
-            # by concatenating YAML double-quoted strings with literal
-            # newlines, which is invalid YAML. Heredocs are safe.
-            local USER_MSG
-            USER_MSG="$(cat "$USER_PAYLOAD")
+          call_nvidia() {
+            local user_msg="$1" temp="$2"
+            local REQUEST_BODY RESPONSE_FILE HTTP_CODE
+            REQUEST_BODY=$(jq -n \
+              --arg model "$NVIDIA_MODEL" --arg sys "$SYSTEM_PROMPT" --arg user "$user_msg" \
+              --argjson temp "$temp" --argjson mtok "$NVIDIA_MAX_TOKENS" \
+              '{model:$model, temperature:$temp, max_tokens:$mtok,
+                messages:[{role:"system",content:$sys},{role:"user",content:$user}]}')
+            RESPONSE_FILE=$(mktemp)
+            HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" \
+              -H "Authorization: Bearer $NVIDIA_API_KEY" -H "Content-Type: application/json" \
+              --connect-timeout 60 --max-time 1200 \
+              --retry 5 --retry-delay 15 --retry-all-errors --retry-max-time 900 \
+              -X POST "$NVIDIA_BASE_URL" -d "$REQUEST_BODY" || echo "000")
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "::error::NVIDIA call HTTP $HTTP_CODE"
+              cat "$RESPONSE_FILE" || true
+              rm -f "$RESPONSE_FILE"
+              return 1
+            fi
+            ASSISTANT=$(jq -r '.choices[0].message.content // ""' "$RESPONSE_FILE")
+            FINISH_REASON=$(jq -r '.choices[0].finish_reason // ""' "$RESPONSE_FILE")
+            rm -f "$RESPONSE_FILE"
+            return 0
+          }
+
+          # ------------------------------------------------------------
+          # 3. generate_section <id> <prompt_file> <report_file> <log>
+          #                      <own_heading> <all_headings_csv>
+          #                      [extra_context_text]
+          #    extra_context_text (optional) = PARSED_LIST injected
+          #    into the prompt for grounded sections.
+          #    Returns 0 success (appends block), 1 hard fail, 2 exhausted.
+          #    On success, sets GENERATED_BLOCK to the raw section text
+          #    (used by the caller to parse VULN-IDs out of Findings).
+          # ------------------------------------------------------------
+          generate_section() {
+            local section_id="$1" prompt_file="$2" report_file="$3" log_file="$4"
+            local own_heading="$5" all_headings_csv="$6" extra_context="${7:-}"
+            local attempt=0 temp="$NVIDIA_TEMPERATURE" failure_note=""
+
+            while [ "$attempt" -lt "$MAX_SECTION_RETRIES" ]; do
+              attempt=$((attempt + 1))
+              echo "[$section_id] attempt $attempt/$MAX_SECTION_RETRIES (temp=$temp)"
+
+              local base_msg
+              base_msg="$(cat "$USER_PAYLOAD")
 
           ---
+          ${extra_context}
 
           ## Section to produce NOW: ${section_id}
 
-          $(cat "$section_prompt_file")
+          $(cat "$prompt_file")
+
+          ${failure_note}
 
           Emit ONLY this section, formatted as a single Markdown fenced code block.
-          Use exactly four tilde characters for the OUTER fence so any normal
-          triple-backtick code samples inside the section remain valid:
+          Use exactly four tilde characters for the OUTER fence:
 
           ~~~~markdown
           ...this section's content, with its '# <Section Name>' header...
@@ -298,114 +282,101 @@ jobs:
 
           No other sections. No preamble. No postamble. Stop after the closing fence."
 
-            local REQUEST_BODY
-            REQUEST_BODY=$(jq -n \
-              --arg model  "$NVIDIA_MODEL" \
-              --arg sys    "$SYSTEM_PROMPT" \
-              --arg user   "$USER_MSG" \
-              --argjson temp  "$NVIDIA_TEMPERATURE" \
-              --argjson mtok "$NVIDIA_MAX_TOKENS" \
-              '{model: $model, temperature: $temp, max_tokens: $mtok,
-                messages: [
-                  {role: "system", content: $sys},
-                  {role: "user",   content: $user}
-                ]}')
+              local raw_accum="" sub=0 msg="$base_msg"
+              while [ "$sub" -lt "$MAX_CONTINUATIONS" ]; do
+                sub=$((sub + 1))
+                if ! call_nvidia "$msg" "$temp"; then
+                  return 1
+                fi
+                raw_accum+="$ASSISTANT"
+                {
+                  echo "=== $section_id attempt $attempt sub $sub (finish_reason=$FINISH_REASON) ==="
+                  printf '%s\n' "$ASSISTANT" | head -c 2000
+                  echo "--- END ---"
+                } >> "$log_file"
 
-            local RESPONSE_FILE
-            RESPONSE_FILE=$(mktemp)
-            local HTTP_CODE
-            HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" \
-              -H "Authorization: Bearer $NVIDIA_API_KEY" \
-              -H "Content-Type: application/json" \
-              --connect-timeout 60 \
-              --max-time 1200 \
-              --retry 5 \
-              --retry-delay 15 \
-              --retry-all-errors \
-              --retry-max-time 900 \
-              -X POST "$NVIDIA_BASE_URL" \
-              -d "$REQUEST_BODY" || echo "000")
+                if [ "$FINISH_REASON" != "length" ]; then break; fi
 
-            echo "[$section_id] HTTP $HTTP_CODE"
+                echo "[$section_id] truncated, requesting continuation ($sub/$MAX_CONTINUATIONS)"
+                local tail_ctx
+                tail_ctx=$(printf '%s' "$raw_accum" | tail -c 2000)
+                msg="Continue the '${section_id}' section EXACTLY where you left off. Do not repeat any text.
+          Here is the end of what you already wrote:
 
-            if [ "$HTTP_CODE" != "200" ]; then
-              echo "::error::[$section_id] NVIDIA scan HTTP $HTTP_CODE (expected 200)"
-              echo "=== Response ==="
-              cat "$RESPONSE_FILE" || true
-              echo "=== End ==="
-              rm -f "$RESPONSE_FILE"
-              return 1
-            fi
+          ${tail_ctx}
 
-            local ASSISTANT
-            ASSISTANT=$(jq -r '.choices[0].message.content // ""' "$RESPONSE_FILE")
-            rm -f "$RESPONSE_FILE"
-            if [ -z "$ASSISTANT" ]; then
-              echo "::error::[$section_id] NVIDIA scan returned empty assistant content."
-              return 2
-            fi
+          Continue from immediately after that. When complete, close with the ~~~~ fence."
+              done
 
-            # Log full transcript for debugging.
-            {
-              echo "=== Section: $section_id ==="
-              echo "--- USER PROMPT (truncated to 4000 chars) ---"
-              cat "$section_prompt_file" | head -c 4000
-              echo
-              echo "--- ASSISTANT REPLY (raw, first 4000 chars) ---"
-              printf '%s\n' "$ASSISTANT" | head -c 4000
-              echo
-              echo "--- END ---"
-            } >> "$section_log"
+              if [ "$FINISH_REASON" = "length" ]; then
+                echo "::warning::[$section_id] still truncated after $MAX_CONTINUATIONS continuations; retrying."
+                failure_note="NOTE: your previous attempt was truncated before completion. Be more concise per item so the full section fits."
+                temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
+                continue
+              fi
 
-            # Extract the outer ~~~~markdown block. Four tildes let the
-            # generated section safely contain normal triple-backtick
-            # code blocks without truncating the report.
-            local BLOCK
-            BLOCK=$(printf '%s\n' "$ASSISTANT" \
-              | awk '
-                  /^~~~~markdown[[:space:]]*$/ { if (!in_block) {in_block=1; next} }
-                  /^~~~~[[:space:]]*$/         { if (in_block) {exit} }
-                  in_block {print}
-                ')
+              local BLOCK
+              if ! BLOCK=$(printf '%s' "$raw_accum" | extract_block); then
+                echo "::warning::[$section_id] no valid fence found; retrying."
+                failure_note="NOTE: your previous attempt did not use the required ~~~~markdown ... ~~~~ fence correctly."
+                continue
+              fi
 
-            if [ -z "$BLOCK" ]; then
-              echo "::warning::[$section_id] no ~~~~markdown block found; using raw assistant content."
-              BLOCK=$(printf '%s\n' "$ASSISTANT")
-            fi
+              IFS=',' read -ra ALL_HEADINGS <<< "$all_headings_csv"
+              if contains_other_heading "$BLOCK" "$own_heading" "${ALL_HEADINGS[@]}"; then
+                echo "::warning::[$section_id] leaked another section's heading; retrying."
+                failure_note="NOTE: your previous attempt included content belonging to a different section. Only output '${own_heading}'."
+                continue
+              fi
 
-            if [ -z "$BLOCK" ]; then
-              echo "::error::[$section_id] block extraction produced empty content."
-              return 2
-            fi
+              # Grounding check — only applies when we gave the model a
+              # PARSED_LIST to work from (i.e. not the Findings section itself).
+              if [ -n "$extra_context" ] && [ -n "${PARSED_IDS:-}" ]; then
+                local USED_IDS UNKNOWN_IDS
+                USED_IDS=$(printf '%s' "$BLOCK" | grep -oE 'VULN-[0-9]+' | sort -u || true)
+                UNKNOWN_IDS=$(comm -23 <(printf '%s\n' "$USED_IDS") <(printf '%s\n' "$PARSED_IDS" | sort -u) || true)
+                if [ -n "$UNKNOWN_IDS" ]; then
+                  echo "::warning::[$section_id] referenced unknown IDs: $(printf '%s' "$UNKNOWN_IDS" | tr '\n' ' ')"
+                  failure_note="NOTE: you referenced VULN-IDs not in the provided findings list ($(printf '%s' "$UNKNOWN_IDS" | tr '\n' ' ')). Only use IDs from the list given to you."
+                  continue
+                fi
+              fi
 
-            # Append the section. We wrap each section in HTML-style
-            # comment markers so the outer loop can detect "this
-            # section is present" by grepping for the BEGIN marker.
-            {
-              echo
-              echo "<!-- BEGIN SECTION: $section_id -->"
-              printf '%s\n' "$BLOCK"
-              echo "<!-- END SECTION: $section_id -->"
-              echo
-            } >> "$section_file"
+              local wc_words
+              wc_words=$(printf '%s' "$BLOCK" | wc -w)
+              if [ "$wc_words" -lt "$MIN_SECTION_WORDS" ]; then
+                echo "::warning::[$section_id] suspiciously short ($wc_words words); retrying."
+                failure_note="NOTE: your previous attempt was too short/empty. Produce the full section with real content."
+                continue
+              fi
 
-            echo "[$section_id] appended $(printf '%s' "$BLOCK" | wc -c) bytes"
-            return 0
+              {
+                echo
+                echo "<!-- BEGIN SECTION: $section_id -->"
+                printf '%s\n' "$BLOCK"
+                echo "<!-- END SECTION: $section_id -->"
+                echo
+              } >> "$report_file"
+
+              GENERATED_BLOCK="$BLOCK"
+              echo "[$section_id] OK — appended $(printf '%s' "$BLOCK" | wc -c) bytes on attempt $attempt"
+              return 0
+            done
+
+            echo "::error::[$section_id] exhausted $MAX_SECTION_RETRIES attempts."
+            return 2
           }
 
           # ------------------------------------------------------------
-          # 3. Write the per-section prompts to temp files. The
-          #    do_one_section helper reads its prompt from a file
-          #    (not a YAML-inlined string) so we never have to fight
-          #    YAML's no-literal-newline-in-double-quotes rule.
+          # 4. Prompt files (unchanged content, same six sections).
           # ------------------------------------------------------------
           PROMPT_DIR=$(mktemp -d)
           cat > "$PROMPT_DIR/executive_summary.txt" <<'PROMPT_EOF'
-          Produce the '# Executive Summary' section of SECURITY_ASSESSMENT_REPORT.md for this codebase. Cover: (a) the scope of the review (which files/areas you examined), (b) the methodology used (the check categories from your system prompt that you actually applied), (c) the top-line risk posture (one paragraph), and (d) a count of findings by severity (Critical/High/Medium/Low). Do NOT list individual findings here — that comes in the next section.
+          Produce the '# Executive Summary' section of SECURITY_ASSESSMENT_REPORT.md. Cover: (a) scope reviewed, (b) methodology (check categories from your system prompt actually applied), (c) one-paragraph risk posture, (d) finding counts by severity — USE THE EXACT COUNTS GIVEN TO YOU BELOW, do not recompute them. Do NOT list individual findings here.
           PROMPT_EOF
 
           cat > "$PROMPT_DIR/risk_matrix.txt" <<'PROMPT_EOF'
-          Produce ONLY the '# Risk Matrix' section: a single Markdown table with columns 'Severity' and 'Likelihood', and rows for each combination (Critical/High/Medium/Low × High/Medium/Low). For each cell, give the count of findings that fall into that bucket based on your analysis of the input. Below the table, add one sentence explaining the methodology (e.g. severity = business impact, likelihood = exploitability given the current configuration).
+          Produce ONLY the '# Risk Matrix' section: a Markdown table, columns 'Severity' and 'Likelihood', rows for each combination. Populate counts using ONLY the VULN-IDs given to you below — do not invent additional findings. Add one sentence on methodology.
           PROMPT_EOF
 
           cat > "$PROMPT_DIR/vulnerability_findings.txt" <<'PROMPT_EOF'
@@ -427,26 +398,23 @@ jobs:
           - **Business Impact:** <one paragraph>
           - **Confidence:** High | Medium | Low
 
-          Order findings Critical → High → Medium → Low. If a check category yields no findings, you may omit it. Do NOT include any other section in your reply — just the findings, one after another, in the schema above.
+          Order Critical → High → Medium → Low. Number VULN-IDs sequentially starting at VULN-001. Do NOT include any other section.
           PROMPT_EOF
 
           cat > "$PROMPT_DIR/owasp_mapping.txt" <<'PROMPT_EOF'
-          Produce ONLY the '# OWASP Top 10 Mapping' section: for each OWASP Top 10 2021 category that has at least one finding in this codebase, list the category name and the VULN-IDs that map to it. Use a Markdown table or a per-category sub-list. Categories with zero findings may be omitted. Do NOT include any other section.
+          Produce ONLY the '# OWASP Top 10 Mapping' section: for each OWASP category present, list the category name and the VULN-IDs given to you below that map to it. Use ONLY those VULN-IDs — do not invent new ones. Do NOT include any other section.
           PROMPT_EOF
 
           cat > "$PROMPT_DIR/cwe_mapping.txt" <<'PROMPT_EOF'
-          Produce ONLY the '# CWE Mapping' section: for each CWE that has at least one finding, list the CWE ID + name and the VULN-IDs that map to it. Use a Markdown table. CWEs with zero findings may be omitted. Do NOT include any other section.
+          Produce ONLY the '# CWE Mapping' section: for each CWE present, list the CWE ID + name and the VULN-IDs given to you below that map to it. Use ONLY those VULN-IDs. Do NOT include any other section.
           PROMPT_EOF
 
           cat > "$PROMPT_DIR/remediation_roadmap.txt" <<'PROMPT_EOF'
-          Produce ONLY the '# Priority Remediation Roadmap' section: an ordered list (Critical → Low) of concrete remediation steps, one per VULN-ID, with a 1-3 sentence fix recommendation each. End with a '## Next Steps' sub-section listing the top 3 actions the developer should take first. Do NOT include any other section.
+          Produce ONLY the '# Priority Remediation Roadmap' section: ordered list (Critical → Low) of remediation steps, ONE PER VULN-ID GIVEN TO YOU BELOW — do not invent additional VULN-IDs. 1-3 sentence fix each. End with '## Next Steps' — top 3 actions. Do NOT include any other section.
           PROMPT_EOF
 
-          # Section metadata. We iterate over this list to call
-          # do_one_section. The "id" is what we put in the BEGIN/END
-          # markers, and is also the heading we expect in the model
-          # reply (so the outer loop can verify presence).
-          SECTIONS=(
+          # heading | slug
+          SECTIONS_DISPLAY_ORDER=(
             "Executive Summary|executive_summary"
             "Risk Matrix|risk_matrix"
             "Vulnerability Findings|vulnerability_findings"
@@ -454,119 +422,76 @@ jobs:
             "CWE Mapping|cwe_mapping"
             "Priority Remediation Roadmap|remediation_roadmap"
           )
+          ALL_HEADINGS_CSV=$(printf '%s\n' "${SECTIONS_DISPLAY_ORDER[@]}" | awk -F'|' '{printf "%s,", $1}' | sed 's/,$//')
 
-          # ------------------------------------------------------------
-          # 4. Completion loop. We do up to MAX_PASSES outer passes.
-          #    On each pass, for every section that is NOT yet present
-          #    in the report, call do_one_section. If the call
-          #    succeeds and the section marker is now in the report,
-          #    that section is "done" and won't be re-called. Sections
-          #    that keep returning empty blocks are retried up to
-          #    MAX_SECTION_RETRIES times before the workflow fails. A
-          #    partial report must never be accepted or committed.
-          # ------------------------------------------------------------
           REPORT_PARTS=$(mktemp)
           SECTION_LOG=$(mktemp)
-          # Per-section retry counter. Tracks how many times we've
-          # tried each section in this run.
-          declare -A RETRY_COUNT
-          # Per-section "given up" flag. If a section hits its retry
-          # cap, we stop trying it and fail before assembling a report.
-          declare -A GIVEN_UP
-          for entry in "${SECTIONS[@]}"; do
-            slug="${entry##*|}"
-            RETRY_COUNT["$slug"]=0
-            GIVEN_UP["$slug"]=0
-          done
 
-          pass=0
-          while [ "$pass" -lt "$MAX_PASSES" ]; do
-            pass=$((pass + 1))
-            echo "=== NVIDIA SCAN: outer pass $pass / $MAX_PASSES ==="
-            missing_in_pass=0
+          # ------------------------------------------------------------
+          # 5. GENERATION ORDER (differs from display order):
+          #    Findings -> parse -> {Risk Matrix, OWASP, CWE, Roadmap}
+          #    -> Executive Summary (last, uses real counts).
+          # ------------------------------------------------------------
 
-            for entry in "${SECTIONS[@]}"; do
-              heading="${entry%%|*}"
-              slug="${entry##*|}"
+          echo "=== Step 1/3: Vulnerability Findings (source of truth) ==="
+          if ! generate_section "vulnerability_findings" "$PROMPT_DIR/vulnerability_findings.txt" \
+                                 "$REPORT_PARTS" "$SECTION_LOG" \
+                                 "Vulnerability Findings" "$ALL_HEADINGS_CSV" ""; then
+            rc=$?; [ "$rc" -eq 1 ] && exit 1
+            echo "::error::Could not generate Vulnerability Findings after retries. Aborting."
+            exit 1
+          fi
+          FINDINGS_BLOCK="$GENERATED_BLOCK"
 
-              # Skip sections that exhausted their retry budget.
-              if [ "${GIVEN_UP[$slug]}" = "1" ]; then
-                continue
-              fi
+          echo "=== Step 2/3: Parsing real IDs (local, no API call) ==="
+          PARSED_LIST=$(printf '%s\n' "$FINDINGS_BLOCK" | awk '
+            /^### VULN-[0-9]+/      { id=$2; sub(/^VULN-/,"",id); vid="VULN-"id }
+            /\*\*CWE:\*\*/          { cwe=$0; sub(/.*\*\*CWE:\*\* */,"",cwe) }
+            /\*\*OWASP Top 10:\*\*/ { owasp=$0; sub(/.*\*\*OWASP Top 10:\*\* */,"",owasp) }
+            /\*\*Severity:\*\*/     { sev=$0; sub(/.*\*\*Severity:\*\* */,"",sev);
+                                       print vid " | " cwe " | " owasp " | " sev }
+          ')
+          PARSED_IDS=$(printf '%s\n' "$FINDINGS_BLOCK" | grep -oE 'VULN-[0-9]+' | sort -u)
+          CRIT=$(printf '%s\n' "$PARSED_LIST" | grep -ic 'Critical' || true)
+          HIGH=$(printf '%s\n' "$PARSED_LIST" | grep -ic ' High' || true)
+          MED=$(printf '%s\n' "$PARSED_LIST" | grep -ic 'Medium' || true)
+          LOW=$(printf '%s\n' "$PARSED_LIST" | grep -ic ' Low' || true)
+          echo "Parsed $(printf '%s\n' "$PARSED_IDS" | grep -c . || echo 0) findings — Critical:$CRIT High:$HIGH Medium:$MED Low:$LOW"
 
-              # Skip sections that already produced a BEGIN marker.
-              if grep -q "BEGIN SECTION: $slug" "$REPORT_PARTS" 2>/dev/null; then
-                continue
-              fi
+          MAPPING_CONTEXT="## Real findings to reference (use ONLY these VULN-IDs, do not invent more)
+          Format: VULN-ID | CWE | OWASP category | Severity
 
-              missing_in_pass=$((missing_in_pass + 1))
-              echo "[pass $pass] calling section '$slug' (attempt $((${RETRY_COUNT[$slug]} + 1)))"
+          ${PARSED_LIST}"
 
-              if do_one_section "$slug" \
-                                "$PROMPT_DIR/${slug}.txt" \
-                                "$REPORT_PARTS" \
-                                "$SECTION_LOG"; then
-                # Success — section is now in the report (the BEGIN
-                # marker is in place). Reset retry counter so a future
-                # failure won't immediately bail.
-                RETRY_COUNT["$slug"]=0
-              else
-                rc=$?
-                if [ "$rc" = "1" ]; then
-                  echo "::error::[$slug] hard failure; aborting run."
-                  exit 1
-                fi
-                # rc=2: empty block. Increment retry; if at cap, mark given-up.
-                RETRY_COUNT["$slug"]=$((${RETRY_COUNT[$slug]} + 1))
-                if [ "${RETRY_COUNT[$slug]}" -ge "$MAX_SECTION_RETRIES" ]; then
-                  echo "::warning::[$slug] exhausted $MAX_SECTION_RETRIES retries; giving up on this section."
-                  GIVEN_UP["$slug"]=1
-                fi
-              fi
-            done
-
-            # If every section is present, we're done.
-            remaining=0
-            for entry in "${SECTIONS[@]}"; do
-              slug="${entry##*|}"
-              if [ "${GIVEN_UP[$slug]}" = "1" ]; then
-                continue
-              fi
-              if ! grep -q "BEGIN SECTION: $slug" "$REPORT_PARTS" 2>/dev/null; then
-                remaining=$((remaining + 1))
-              fi
-            done
-
-            echo "[pass $pass] sections still missing: $remaining"
-            if [ "$remaining" = "0" ]; then
-              echo "[pass $pass] all sections present. Exiting completion loop."
-              break
-            fi
-            if [ "$missing_in_pass" = "0" ]; then
-              # Nothing to do this pass — shouldn't happen given the
-              # remaining>0 check above, but defensively break.
-              echo "[pass $pass] no progress; breaking loop."
-              break
-            fi
-          done
-
+          echo "=== Step 3/3: Dependent sections (grounded on parsed list) ==="
           failed_sections=0
-          for entry in "${SECTIONS[@]}"; do
-            slug="${entry##*|}"
-            if [ "${GIVEN_UP[$slug]}" = "1" ]; then
-              echo "::error::[$slug] could not be generated after $MAX_SECTION_RETRIES retries."
+          for entry in "Risk Matrix|risk_matrix" "OWASP Top 10 Mapping|owasp_mapping" \
+                       "CWE Mapping|cwe_mapping" "Priority Remediation Roadmap|remediation_roadmap"; do
+            heading="${entry%%|*}"; slug="${entry##*|}"
+            if ! generate_section "$slug" "$PROMPT_DIR/${slug}.txt" "$REPORT_PARTS" "$SECTION_LOG" \
+                                   "$heading" "$ALL_HEADINGS_CSV" "$MAPPING_CONTEXT"; then
+              rc=$?; [ "$rc" -eq 1 ] && exit 1
               failed_sections=$((failed_sections + 1))
             fi
           done
+
+          SUMMARY_CONTEXT="## Real finding counts (use these exact numbers, do not recompute)
+          Critical: ${CRIT} | High: ${HIGH} | Medium: ${MED} | Low: ${LOW}
+          Total findings: $(printf '%s\n' "$PARSED_IDS" | grep -c . || echo 0)"
+
+          if ! generate_section "executive_summary" "$PROMPT_DIR/executive_summary.txt" "$REPORT_PARTS" "$SECTION_LOG" \
+                                 "Executive Summary" "$ALL_HEADINGS_CSV" "$SUMMARY_CONTEXT"; then
+            rc=$?; [ "$rc" -eq 1 ] && exit 1
+            failed_sections=$((failed_sections + 1))
+          fi
+
           if [ "$failed_sections" -ne 0 ]; then
-            echo "::error::Refusing to assemble a partial assessment report."
+            echo "::error::$failed_sections section(s) failed. Refusing to assemble a partial report."
             exit 1
           fi
 
           # ------------------------------------------------------------
-          # 5. Stitch the sections into the final report. Add a title
-          #    and a table of contents at the top so the report is
-          #    self-contained.
+          # 6. Stitch in ORIGINAL DISPLAY ORDER (unchanged from before).
           # ------------------------------------------------------------
           {
             echo "# SECURITY ASSESSMENT REPORT"
@@ -583,35 +508,34 @@ jobs:
             echo "5. [CWE Mapping](#cwe-mapping)"
             echo "6. [Priority Remediation Roadmap](#priority-remediation-roadmap)"
             echo
-            cat "$REPORT_PARTS"
+
+            for entry in "${SECTIONS_DISPLAY_ORDER[@]}"; do
+              slug="${entry##*|}"
+              awk -v marker="BEGIN SECTION: $slug" '
+                $0 ~ marker {flag=1; next}
+                /END SECTION:/ {flag=0}
+                flag {print}
+              ' "$REPORT_PARTS"
+            done
           } > "$ASSESSMENT_REPORT"
 
           REPORT_BYTES=$(wc -c < "$ASSESSMENT_REPORT")
-          echo "=== NVIDIA SCAN: report assembled ==="
           echo "Report size: $REPORT_BYTES bytes"
-          echo "Section transcript: $SECTION_LOG"
 
-          # Validate: must be non-empty and contain every required heading.
           if [ "$REPORT_BYTES" -lt 200 ]; then
             echo "::error::Assessment report suspiciously small ($REPORT_BYTES bytes). Aborting."
             exit 1
           fi
           for expected_heading in \
-            "# Executive Summary" \
-            "# Risk Matrix" \
-            "# Vulnerability Findings" \
-            "# OWASP Top 10 Mapping" \
-            "# CWE Mapping" \
-            "# Priority Remediation Roadmap"; do
+            "# Executive Summary" "# Risk Matrix" "# Vulnerability Findings" \
+            "# OWASP Top 10 Mapping" "# CWE Mapping" "# Priority Remediation Roadmap"; do
             if ! grep -Fq "$expected_heading" "$ASSESSMENT_REPORT"; then
               echo "::error::Assessment report missing required heading: $expected_heading"
               exit 1
             fi
           done
 
-          # Save the per-section transcript for debugging.
           cp "$SECTION_LOG" .claude/reports/nvidia-scan-transcript.log || true
-
           echo "Wrote $ASSESSMENT_REPORT ($REPORT_BYTES bytes)."
 
       - name: Upload nvidia-scan transcript
@@ -630,68 +554,40 @@ jobs:
           path: ${{ env.ASSESSMENT_REPORT }}
           retention-days: 90
 
-      # -----------------------------------------------------------
-      # 2e. (removed) NVIDIA remediation agent.
-      #     Previously: read assessment report, ask NVIDIA for patches,
-      #     apply them, run gate A (mvn compile test-compile), revert
-      #     on failure, write SECURE_REMEDIATION_REPORT.md.
-      #     Removed per pipeline change: the scanner is the only
-      #     model-driven step. The git-agent only commits the report
-      #     and pushes a chain step — it does not change source code.
-      # -----------------------------------------------------------
-
       - name: Stage assessment working-tree changes
-        # Always stage — git-agent will decide whether there is something to push.
         run: |
           set -euo pipefail
           git add -A
-          # Force-add the tracked report (its dir is otherwise ignored).
           git add -f "$ASSESSMENT_REPORT" 2>/dev/null || true
           git status --short
           echo "---"
           git diff --cached --stat | tail -n 20
 
-      # -----------------------------------------------------------
-      # 2f. NVIDIA push — creates a per-development-branch chain step.
-      #     Branch family: nvdia_trials_<N>_<TIMESTAMP>.
-      #     The parent of push #N is the previous push #(N-1)'s tip
-      #     (i.e. the tip of nvdia_trials_<MAX_N>_*), or
-      #     the development branch nvdia_trials itself if
-      #     no numbered push exists yet.
-      #     The push step itself is model-free — the scanner is the
-      #     only place the model is used now.
-      # -----------------------------------------------------------
       - name: nvidia-push
         id: nvidia_push
         env:
-          # Family prefix for the chain steps created by this workflow.
-          # Change this if the development branch is renamed.
           CHAIN_PREFIX: nvdia_trials
-          # Development branch the chain hangs off (parent of push #1).
           DEVELOPMENT_BRANCH: nvdia_trials
         run: |
           set -euo pipefail
 
-          # ---- Pre-flight: assessment report must exist and be non-empty ----
           if [ ! -s "$ASSESSMENT_REPORT" ]; then
             echo "::error::Assessment report missing or empty: $ASSESSMENT_REPORT. Aborting push."
             exit 1
           fi
 
-          # ---- Pre-flight: something to commit ----
           if [ -z "$(git status --porcelain)" ]; then
             echo "Nothing to commit. Skipping push."
             echo "skipped" > "$PUSH_REPORT"
             exit 0
           fi
 
-          # ---- Compute max N from remote + local, scoped to the chain family ----
           REMOTE_REFS=$(git ls-remote --heads origin "${CHAIN_PREFIX}_*" 2>/dev/null || true)
           LOCAL_BRANCHES=$(git branch --list "${CHAIN_PREFIX}_*" || true)
           MAX_N=0
           PARENT="${DEVELOPMENT_BRANCH}"
           for ref in $REMOTE_REFS $LOCAL_BRANCHES; do
-            ref=${ref##*/}            # strip origin/ if present
+            ref=${ref##*/}
             n=$(printf '%s' "$ref" | sed -nE "s/^${CHAIN_PREFIX//\//\\/}_([0-9]+)_.*/\1/p")
             if [ -n "$n" ] && [ "$n" -gt "$MAX_N" ]; then
               MAX_N=$n
@@ -700,7 +596,6 @@ jobs:
           done
           NEW_N=$((MAX_N + 1))
 
-          # ---- Workflow-supplied timestamp (source of truth) ----
           TS=$(date +%Y-%m-%d_%H-%M-%S)
           if [ -z "$TS" ] || printf '%s' "$TS" | grep -q 'time_of_push'; then
             echo "::error::Timestamp step failed (contains literal 'time_of_push'). Aborting."
@@ -708,17 +603,12 @@ jobs:
           fi
           NEW_BRANCH="${CHAIN_PREFIX}_${NEW_N}_${TS}"
 
-          # ---- Branch-name hard-rule validation (workflow is the source of truth) ----
           BRANCH_REGEX="^${CHAIN_PREFIX//\//\\/}_[0-9]+_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$"
           if ! printf '%s' "$NEW_BRANCH" | grep -qE "$BRANCH_REGEX"; then
             echo "::error::Computed branch '$NEW_BRANCH' does not match the required format."
             exit 1
           fi
 
-          # ---- Build the commit message from the assessment report ----
-          # Pull up to 8 bullet lines out of "# Findings" to use as the body.
-          # The scanner agent uses "# Findings" (or "# Executive Summary" for
-          # older versions) — we try Findings first, fall back to Exec Summary.
           CHANGES_SUMMARY=$(awk '
               /^# Findings/{flag=1; next}
               /^# Executive Summary/{ if (!flag) flag=1; next }
@@ -734,7 +624,6 @@ jobs:
           fi
           BULLETS=$(printf '%s' "$CHANGES_SUMMARY" | tr '|' '\n' | sed 's/^/- /' | paste -sd '\n' -)
 
-          # Subject line: keep under 72 chars.
           SUBJECT="NVIDIA git-agent push #${NEW_N} — security scan report"
           if [ "${#SUBJECT}" -gt 72 ]; then
             SUBJECT="NVIDIA git-agent push #${NEW_N} — scan report"
@@ -748,14 +637,11 @@ jobs:
             "Manual merge target: ${DEVELOPMENT_BRANCH} (then main, human review required)" \
             "Co-Authored-By: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>")
 
-          # ---- Final pre-flight ----
           echo "Computed push: branch=${NEW_BRANCH} parent=${PARENT} N=${NEW_N} ts=${TS}"
 
-          # Make sure the parent is fetched (in case it's only on the remote).
           if [ "$PARENT" != "${DEVELOPMENT_BRANCH}" ]; then
             git fetch origin "$PARENT" 2>/dev/null || true
           else
-            # First push — make sure the development branch itself is up to date.
             git fetch origin "${DEVELOPMENT_BRANCH}" 2>/dev/null || true
           fi
 
@@ -765,11 +651,9 @@ jobs:
           git checkout "$PARENT"
           git checkout -b "$NEW_BRANCH"
           git stash pop || true
-          # Re-stage on the new branch (working tree carries over, but be safe).
           git add -A
           git add -f "$ASSESSMENT_REPORT" 2>/dev/null || true
 
-          # Commit (use a temp file for the message to preserve newlines exactly).
           MSG_FILE=$(mktemp)
           printf '%s' "$COMMIT_MSG" > "$MSG_FILE"
           git commit -F "$MSG_FILE"
@@ -786,42 +670,22 @@ jobs:
 
           COMMIT_SHA=$(git rev-parse HEAD)
           REMOTE_URL=$(git remote get-url origin)
-
-          # Switch back to the parent so the runner is in a clean state.
           git checkout "$PARENT"
 
-          # Write the push report.
           {
             echo "# Git Push Report — NVIDIA git-agent Push #${NEW_N}"
             echo
             echo "- **Development branch:** \`${DEVELOPMENT_BRANCH}\`"
             echo "- **Parent branch:** \`${PARENT}\`"
             echo "- **Push branch:** \`${NEW_BRANCH}\`"
-            echo "- **Push time:** ${TS} (workflow-computed; literal 'time_of_push' is a hard-fail)"
+            echo "- **Push time:** ${TS}"
             echo "- **Remote:** origin (${REMOTE_URL})"
             echo "- **Commit:** ${COMMIT_SHA}"
             echo "- **Code changes:** none (remediation agent removed; only the assessment report is committed)"
-            echo "- **Chain step decision:** workflow-computed (no model in the push step)"
             echo
             echo "## Files Pushed"
             echo
             git show --stat --name-only --format="" "$COMMIT_SHA" | sed 's/^/- /'
-            echo
-            echo "## Notes"
-            echo
-            echo "- The push branch is named with an incrementing counter so the"
-            echo "  developer always knows which push is the latest."
-            echo "- This push is a chain step of the development branch"
-            echo "  \`${DEVELOPMENT_BRANCH}\`; its parent is the previous push's"
-            echo "  tip (or the development branch itself for push #1). The chain is:"
-            echo "  \`${DEVELOPMENT_BRANCH}\` → ... → \`${PARENT}\` → \`${NEW_BRANCH}\`."
-            echo "- Run \`git fetch origin\` locally and inspect"
-            echo "  \`${NEW_BRANCH}\` before merging."
-            echo "- Only the NVIDIA scanner agent (${NVIDIA_MODEL} via"
-            echo "  ${NVIDIA_BASE_URL}) ran in this pipeline. The remediation"
-            echo "  agent has been removed; no source code was modified. The"
-            echo "  assessment report describes the vulnerabilities found;"
-            echo "  remediation is left to the developer."
           } > "$PUSH_REPORT"
 
           echo "Pushed: $NEW_BRANCH @ $COMMIT_SHA"
@@ -836,14 +700,6 @@ jobs:
           path: ${{ env.PUSH_REPORT }}
           retention-days: 90
 
-      # -----------------------------------------------------------
-      # 2g. Commit the assessment report back to the original
-      #     trigger branch (the branch the workflow was launched
-      #     from), not to the parent chain step we just created.
-      #     The chain step itself was already pushed in 2f.
-      #     We switch to ${GITHUB_REF_NAME} (the trigger branch)
-      #     so the report lands where the developer is looking.
-      # -----------------------------------------------------------
       - name: Commit assessment report back to trigger branch
         if: always() && hashFiles(env.ASSESSMENT_REPORT) != ''
         run: |
@@ -851,19 +707,12 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Recover the original trigger branch. After nvidia-push the
-          # runner is checked out on the parent chain step, so we have
-          # to switch back to the branch the workflow was launched from.
           TRIGGER_BRANCH="${GITHUB_REF_NAME}"
           if [ -z "$TRIGGER_BRANCH" ] || [ "$TRIGGER_BRANCH" = "null" ]; then
             echo "::error::GITHUB_REF_NAME is empty — cannot determine trigger branch."
             exit 1
           fi
 
-          # Sanity: never push report updates to a chain step. The chain
-          # step is always `${CHAIN_PREFIX}_<N>_<TS>` (e.g. nvdia_trials_1_…)
-          # — we must not accidentally commit reports there. Reports
-          # belong on the development branch (the trigger).
           case "$TRIGGER_BRANCH" in
             nvdia_trials_[0-9]*_*)
               echo "::error::Refusing to push report updates to a chain step branch: $TRIGGER_BRANCH"
