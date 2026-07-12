@@ -12,9 +12,16 @@ The risk matrix below is a table that maps the severity of the vulnerabilities f
 | High | Low | 0 |
 | Medium | High | 1 |
 | Medium | Medium | 0 |
-| Medium | Low | 1 |
+| Medium | Low | 0 |
 | Low | High | 0 |
+<<<<<<< Updated upstream
 | Low | Medium | 2 |
 | Low | Low | 1 |
 
 Note: The counts are based on the VULN-IDs provided, which are: VULN-001, VULN-002, VULN-003, VULN-004, VULN-005, VULN-006, and VULN-007.
+=======
+| Low | Medium | 0 |
+| Low | Low | 2 |
+
+Note: The counts are based on the provided VULN-IDs and may not reflect the actual risk posture of the application.
+>>>>>>> Stashed changes
