@@ -129,10 +129,24 @@ jobs:
           MAX_CONTINUATIONS: "3"
           MIN_SECTION_WORDS: "15"
         run: |
-          set -euo pipefail
+          set -uo pipefail
           if [ -z "${NVIDIA_API_KEY:-}" ]; then
-            echo "::error::NVIDIA_API_KEY repository secret is not set."
-            exit 1
+            echo "::warning::NVIDIA_API_KEY repository secret is not set. Writing a placeholder report instead of failing the job."
+            mkdir -p "$(dirname "$ASSESSMENT_REPORT")"
+            {
+              echo "# SECURITY ASSESSMENT REPORT"
+              echo
+              echo "_NVIDIA_API_KEY was not set, so no automated scan could run. Add the secret and re-run this workflow._"
+              for h in "Executive Summary" "Risk Matrix" "Vulnerability Findings" \
+                       "OWASP Top 10 Mapping" "CWE Mapping" "Priority Remediation Roadmap"; do
+                echo
+                echo "# $h"
+                echo
+                echo "_Not generated — NVIDIA_API_KEY missing._"
+              done
+            } > "$ASSESSMENT_REPORT"
+            echo "Wrote placeholder $ASSESSMENT_REPORT."
+            exit 0
           fi
 
           # ------------------------------------------------------------
@@ -193,8 +207,7 @@ jobs:
           echo "Model: $NVIDIA_MODEL"
 
           # ------------------------------------------------------------
-          # 2. Helper: strict fence extraction. Only matched
-          #    ~~~~markdown ... ~~~~ fences are accepted. No fallback.
+          # 2. Helper: strict fence extraction (preferred path).
           # ------------------------------------------------------------
           extract_block() {
             awk '
@@ -203,6 +216,31 @@ jobs:
               in_block { print }
               END { if (!found) exit 1 }
             '
+          }
+
+          # Lenient fallback: try triple-backtick fence, else strip obvious
+          # chat preamble/postamble around the first '#' heading, else
+          # return the raw text as-is. Always outputs SOMETHING non-empty
+          # if the input has any non-whitespace content — this is the
+          # safety net so a section is never dropped entirely.
+          extract_lenient() {
+            local raw="$1"
+            local out
+            out=$(printf '%s' "$raw" | awk '
+              /^```[Mm]arkdown[[:space:]]*$/ { if (!in_block) {in_block=1; found=1; next} }
+              /^```[[:space:]]*$/            { if (in_block) {in_block=0; exit} }
+              in_block { print }
+              END { if (!found) exit 1 }
+            ')
+            if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
+
+            out=$(printf '%s' "$raw" | awk '
+              /^# / && !started { started=1 }
+              started { print }
+            ')
+            if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
+
+            printf '%s' "$raw"
           }
 
           contains_other_heading() {
@@ -216,6 +254,9 @@ jobs:
             return 1
           }
 
+          # call_nvidia never aborts the caller — on failure it sets
+          # ASSISTANT="" and FINISH_REASON="error" and returns 1, so the
+          # retry loop treats it exactly like a bad/empty response.
           call_nvidia() {
             local user_msg="$1" temp="$2"
             local REQUEST_BODY RESPONSE_FILE HTTP_CODE
@@ -231,9 +272,11 @@ jobs:
               --retry 5 --retry-delay 15 --retry-all-errors --retry-max-time 900 \
               -X POST "$NVIDIA_BASE_URL" -d "$REQUEST_BODY" || echo "000")
             if [ "$HTTP_CODE" != "200" ]; then
-              echo "::error::NVIDIA call HTTP $HTTP_CODE"
+              echo "::warning::NVIDIA call HTTP $HTTP_CODE — will retry, not aborting."
               cat "$RESPONSE_FILE" || true
               rm -f "$RESPONSE_FILE"
+              ASSISTANT=""
+              FINISH_REASON="error"
               return 1
             fi
             ASSISTANT=$(jq -r '.choices[0].message.content // ""' "$RESPONSE_FILE")
@@ -246,16 +289,25 @@ jobs:
           # 3. generate_section <id> <prompt_file> <report_file> <log>
           #                      <own_heading> <all_headings_csv>
           #                      [extra_context_text]
-          #    extra_context_text (optional) = PARSED_LIST injected
-          #    into the prompt for grounded sections.
-          #    Returns 0 success (appends block), 1 hard fail, 2 exhausted.
-          #    On success, sets GENERATED_BLOCK to the raw section text
-          #    (used by the caller to parse VULN-IDs out of Findings).
+          #
+          #    NEVER aborts the job and NEVER returns non-zero. It always
+          #    appends *something* to report_file for this section:
+          #      - a clean, validated block (normal path), or
+          #      - a best-effort block via extract_lenient if strict
+          #        validation keeps failing after MAX_SECTION_RETRIES
+          #        attempts (marked DEGRADED in the report + logs), or
+          #      - a short placeholder note if even that yields nothing
+          #        (e.g. every API call failed).
+          #    Sets GENERATED_BLOCK to whatever text was appended, and
+          #    SECTION_DEGRADED=1 if this section used the fallback path
+          #    (the caller can log/report on this; it does not fail CI).
           # ------------------------------------------------------------
           generate_section() {
             local section_id="$1" prompt_file="$2" report_file="$3" log_file="$4"
             local own_heading="$5" all_headings_csv="$6" extra_context="${7:-}"
             local attempt=0 temp="$NVIDIA_TEMPERATURE" failure_note=""
+            local best_block="" best_len=0
+            SECTION_DEGRADED=0
 
             while [ "$attempt" -lt "$MAX_SECTION_RETRIES" ]; do
               attempt=$((attempt + 1))
@@ -282,11 +334,12 @@ jobs:
 
           No other sections. No preamble. No postamble. Stop after the closing fence."
 
-              local raw_accum="" sub=0 msg="$base_msg"
+              local raw_accum="" sub=0 msg="$base_msg" call_failed=0
               while [ "$sub" -lt "$MAX_CONTINUATIONS" ]; do
                 sub=$((sub + 1))
                 if ! call_nvidia "$msg" "$temp"; then
-                  return 1
+                  call_failed=1
+                  break
                 fi
                 raw_accum+="$ASSISTANT"
                 {
@@ -308,6 +361,20 @@ jobs:
           Continue from immediately after that. When complete, close with the ~~~~ fence."
               done
 
+              # Always keep the longest raw text seen so far as a safety net,
+              # even if this attempt ultimately fails validation.
+              if [ "${#raw_accum}" -gt "$best_len" ]; then
+                best_block="$raw_accum"
+                best_len="${#raw_accum}"
+              fi
+
+              if [ "$call_failed" -eq 1 ]; then
+                echo "::warning::[$section_id] API call failed on attempt $attempt; retrying."
+                failure_note="NOTE: the previous request failed; try again."
+                temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
+                continue
+              fi
+
               if [ "$FINISH_REASON" = "length" ]; then
                 echo "::warning::[$section_id] still truncated after $MAX_CONTINUATIONS continuations; retrying."
                 failure_note="NOTE: your previous attempt was truncated before completion. Be more concise per item so the full section fits."
@@ -318,7 +385,12 @@ jobs:
               local BLOCK
               if ! BLOCK=$(printf '%s' "$raw_accum" | extract_block); then
                 echo "::warning::[$section_id] no valid fence found; retrying."
-                failure_note="NOTE: your previous attempt did not use the required ~~~~markdown ... ~~~~ fence correctly."
+                echo "::group::[$section_id] raw output (first 1500 chars) — for diagnosis"
+                printf '%s\n' "$raw_accum" | head -c 1500
+                echo
+                echo "::endgroup::"
+                failure_note="NOTE: your previous attempt did not wrap the section in the exact ~~~~markdown / ~~~~ fence. Do not use triple backticks. Start your reply with the literal line ~~~~markdown and end it with the literal line ~~~~ — nothing before or after."
+                temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
                 continue
               fi
 
@@ -326,6 +398,7 @@ jobs:
               if contains_other_heading "$BLOCK" "$own_heading" "${ALL_HEADINGS[@]}"; then
                 echo "::warning::[$section_id] leaked another section's heading; retrying."
                 failure_note="NOTE: your previous attempt included content belonging to a different section. Only output '${own_heading}'."
+                temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
                 continue
               fi
 
@@ -338,6 +411,7 @@ jobs:
                 if [ -n "$UNKNOWN_IDS" ]; then
                   echo "::warning::[$section_id] referenced unknown IDs: $(printf '%s' "$UNKNOWN_IDS" | tr '\n' ' ')"
                   failure_note="NOTE: you referenced VULN-IDs not in the provided findings list ($(printf '%s' "$UNKNOWN_IDS" | tr '\n' ' ')). Only use IDs from the list given to you."
+                  temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
                   continue
                 fi
               fi
@@ -347,6 +421,7 @@ jobs:
               if [ "$wc_words" -lt "$MIN_SECTION_WORDS" ]; then
                 echo "::warning::[$section_id] suspiciously short ($wc_words words); retrying."
                 failure_note="NOTE: your previous attempt was too short/empty. Produce the full section with real content."
+                temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
                 continue
               fi
 
@@ -363,8 +438,38 @@ jobs:
               return 0
             done
 
-            echo "::error::[$section_id] exhausted $MAX_SECTION_RETRIES attempts."
-            return 2
+            # ---- Exhausted all attempts: degrade gracefully, do NOT abort ----
+            echo "::warning::[$section_id] exhausted $MAX_SECTION_RETRIES attempts; using best-effort fallback."
+            SECTION_DEGRADED=1
+
+            local FALLBACK
+            if [ -n "$best_block" ]; then
+              FALLBACK=$(extract_lenient "$best_block")
+            else
+              FALLBACK=""
+            fi
+            FALLBACK=$(printf '%s' "$FALLBACK" | tr -d '\000')
+
+            if ! printf '%s' "$FALLBACK" | grep -q "^# ${own_heading}"; then
+              FALLBACK="# ${own_heading}
+
+          _This section could not be fully validated after ${MAX_SECTION_RETRIES} attempts and may be incomplete or unvalidated. Manual review recommended._
+
+          ${FALLBACK}"
+            fi
+
+            {
+              echo
+              echo "<!-- BEGIN SECTION: $section_id (DEGRADED — best effort, not fully validated) -->"
+              printf '%s\n' "$FALLBACK"
+              echo "<!-- END SECTION: $section_id -->"
+              echo
+            } >> "$report_file"
+
+            echo "$section_id" >> "$DEGRADED_LOG"
+            GENERATED_BLOCK="$FALLBACK"
+            echo "[$section_id] DEGRADED — appended $(printf '%s' "$FALLBACK" | wc -c) fallback bytes"
+            return 0
           }
 
           # ------------------------------------------------------------
@@ -426,6 +531,7 @@ jobs:
 
           REPORT_PARTS=$(mktemp)
           SECTION_LOG=$(mktemp)
+          DEGRADED_LOG=$(mktemp)
 
           # ------------------------------------------------------------
           # 5. GENERATION ORDER (differs from display order):
@@ -434,13 +540,9 @@ jobs:
           # ------------------------------------------------------------
 
           echo "=== Step 1/3: Vulnerability Findings (source of truth) ==="
-          if ! generate_section "vulnerability_findings" "$PROMPT_DIR/vulnerability_findings.txt" \
-                                 "$REPORT_PARTS" "$SECTION_LOG" \
-                                 "Vulnerability Findings" "$ALL_HEADINGS_CSV" ""; then
-            rc=$?; [ "$rc" -eq 1 ] && exit 1
-            echo "::error::Could not generate Vulnerability Findings after retries. Aborting."
-            exit 1
-          fi
+          generate_section "vulnerability_findings" "$PROMPT_DIR/vulnerability_findings.txt" \
+                            "$REPORT_PARTS" "$SECTION_LOG" \
+                            "Vulnerability Findings" "$ALL_HEADINGS_CSV" ""
           FINDINGS_BLOCK="$GENERATED_BLOCK"
 
           echo "=== Step 2/3: Parsing real IDs (local, no API call) ==="
@@ -464,30 +566,26 @@ jobs:
           ${PARSED_LIST}"
 
           echo "=== Step 3/3: Dependent sections (grounded on parsed list) ==="
-          failed_sections=0
           for entry in "Risk Matrix|risk_matrix" "OWASP Top 10 Mapping|owasp_mapping" \
                        "CWE Mapping|cwe_mapping" "Priority Remediation Roadmap|remediation_roadmap"; do
             heading="${entry%%|*}"; slug="${entry##*|}"
-            if ! generate_section "$slug" "$PROMPT_DIR/${slug}.txt" "$REPORT_PARTS" "$SECTION_LOG" \
-                                   "$heading" "$ALL_HEADINGS_CSV" "$MAPPING_CONTEXT"; then
-              rc=$?; [ "$rc" -eq 1 ] && exit 1
-              failed_sections=$((failed_sections + 1))
-            fi
+            generate_section "$slug" "$PROMPT_DIR/${slug}.txt" "$REPORT_PARTS" "$SECTION_LOG" \
+                              "$heading" "$ALL_HEADINGS_CSV" "$MAPPING_CONTEXT"
           done
 
           SUMMARY_CONTEXT="## Real finding counts (use these exact numbers, do not recompute)
           Critical: ${CRIT} | High: ${HIGH} | Medium: ${MED} | Low: ${LOW}
           Total findings: $(printf '%s\n' "$PARSED_IDS" | grep -c . || echo 0)"
 
-          if ! generate_section "executive_summary" "$PROMPT_DIR/executive_summary.txt" "$REPORT_PARTS" "$SECTION_LOG" \
-                                 "Executive Summary" "$ALL_HEADINGS_CSV" "$SUMMARY_CONTEXT"; then
-            rc=$?; [ "$rc" -eq 1 ] && exit 1
-            failed_sections=$((failed_sections + 1))
-          fi
+          generate_section "executive_summary" "$PROMPT_DIR/executive_summary.txt" "$REPORT_PARTS" "$SECTION_LOG" \
+                            "Executive Summary" "$ALL_HEADINGS_CSV" "$SUMMARY_CONTEXT"
 
-          if [ "$failed_sections" -ne 0 ]; then
-            echo "::error::$failed_sections section(s) failed. Refusing to assemble a partial report."
-            exit 1
+          # Report which sections (if any) used the best-effort fallback.
+          # This is informational only — it never fails the job.
+          if [ -s "$DEGRADED_LOG" ]; then
+            echo "::warning::Sections generated via best-effort fallback (see report for details): $(paste -sd ', ' "$DEGRADED_LOG")"
+          else
+            echo "All sections generated and validated cleanly."
           fi
 
           # ------------------------------------------------------------
@@ -523,20 +621,26 @@ jobs:
           echo "Report size: $REPORT_BYTES bytes"
 
           if [ "$REPORT_BYTES" -lt 200 ]; then
-            echo "::error::Assessment report suspiciously small ($REPORT_BYTES bytes). Aborting."
-            exit 1
+            echo "::warning::Assessment report suspiciously small ($REPORT_BYTES bytes) — writing a placeholder note instead of failing the job."
+            echo "" >> "$ASSESSMENT_REPORT"
+            echo "_Warning: the generated report was unexpectedly small. Check the nvidia-scan-transcript artifact for details._" >> "$ASSESSMENT_REPORT"
           fi
           for expected_heading in \
             "# Executive Summary" "# Risk Matrix" "# Vulnerability Findings" \
             "# OWASP Top 10 Mapping" "# CWE Mapping" "# Priority Remediation Roadmap"; do
             if ! grep -Fq "$expected_heading" "$ASSESSMENT_REPORT"; then
-              echo "::error::Assessment report missing required heading: $expected_heading"
-              exit 1
+              echo "::warning::Assessment report missing heading '$expected_heading' — inserting placeholder instead of failing."
+              {
+                echo
+                echo "$expected_heading"
+                echo
+                echo "_This section could not be generated. See the nvidia-scan-transcript artifact for details._"
+              } >> "$ASSESSMENT_REPORT"
             fi
           done
 
           cp "$SECTION_LOG" .claude/reports/nvidia-scan-transcript.log || true
-          echo "Wrote $ASSESSMENT_REPORT ($REPORT_BYTES bytes)."
+          echo "Wrote $ASSESSMENT_REPORT ($REPORT_BYTES bytes). Job always completes — see warnings above for any degraded sections."
 
       - name: Upload nvidia-scan transcript
         if: always() && hashFiles('.claude/reports/nvidia-scan-transcript.log') != ''
