@@ -381,6 +381,10 @@ jobs:
               echo "::warning::[$section_id] continuation contains no new VULN entry."
               return 2
             fi
+            if [ -n "$continuation_file" ] && ! printf '%s\n' "$BLOCK" | grep -Fqx "CONTINUE_FINDINGS"; then
+              echo "::warning::[$section_id] continuation omitted its completion marker."
+              return 2
+            fi
 
             # Append the section. We wrap each section in HTML-style
             # comment markers so the outer loop can detect "this
