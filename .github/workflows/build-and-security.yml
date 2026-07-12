@@ -163,7 +163,6 @@ jobs:
           # same prompt) if the API returned 0 bytes or the fenced
           # block couldn't be extracted.
           MAX_SECTION_RETRIES: "2"
-          VULNERABILITY_PAGE_LIMIT: "30"
         run: |
           set -euo pipefail
           if [ -z "${NVIDIA_API_KEY:-}" ]; then
@@ -254,27 +253,25 @@ jobs:
           echo "Max per-section retries: $MAX_SECTION_RETRIES"
 
           # ------------------------------------------------------------
-          # 2. do_one_section <section-id> <section-heading> <section-prompt-file>
+          # 2. do_one_section <section-id> <section-prompt-file>
           #
           #    Issues one API call. The system prompt + payload are
           #    identical across calls; only the user-message tail
           #    (the "section prompt") changes. The assistant's reply
-          #    is expected to be raw Markdown containing JUST that
-          #    section. The function verifies its required heading
-          #    before appending it to the report.
+          #    is expected to be a single fenced ~~~~markdown block
+          #    containing JUST that section. The function extracts the
+          #    block and appends it to the report.
           #
           #    Returns 0 on success, 1 on a hard failure. If the call
-          #    itself succeeded but its required section is missing,
+          #    itself succeeded but the fenced block came back empty,
           #    returns 2 — caller (the section retry loop) decides
           #    whether to retry.
           # ------------------------------------------------------------
           do_one_section() {
             local section_id="$1"
-            local section_heading="$2"
-            local section_prompt_file="$3"   # file holding the per-section prompt
-            local section_file="$4"          # report parts file to append into
-            local section_log="$5"           # transcript log
-            local continuation_file="${6:-}"
+            local section_prompt_file="$2"   # file holding the per-section prompt
+            local section_file="$3"          # report parts file to append into
+            local section_log="$4"           # transcript log
 
             echo "--- nvidia-scan: requesting section '$section_id' ---"
 
@@ -291,24 +288,15 @@ jobs:
 
           $(cat "$section_prompt_file")
 
-          Emit raw Markdown only. Do NOT put the entire section in an outer
-          fenced code block. Start with exactly '# ${section_heading}'. You may
-          use normal triple-backtick fences only for code samples inside it.
-          No other sections. No preamble."
+          Emit ONLY this section, formatted as a single Markdown fenced code block.
+          Use exactly four tilde characters for the OUTER fence so any normal
+          triple-backtick code samples inside the section remain valid:
 
-            if [ -n "$continuation_file" ]; then
-              USER_MSG="$USER_MSG
+          ~~~~markdown
+          ...this section's content, with its '# <Section Name>' header...
+          ~~~~
 
-          ---
-
-          ## Previously generated vulnerability findings
-
-          $(cat "$continuation_file")
-
-          Continue after the last finding above. Do not repeat or renumber existing
-          findings. Return NO_MORE_FINDINGS on a line by itself only when every
-          remaining vulnerability in the supplied source has been covered."
-            fi
+          No other sections. No preamble. No postamble. Stop after the closing fence."
 
             local REQUEST_BODY
             REQUEST_BODY=$(jq -n \
@@ -369,88 +357,39 @@ jobs:
               echo "--- END ---"
             } >> "$section_log"
 
-            local BLOCK="$ASSISTANT"
-            if [ -n "$continuation_file" ] && printf '%s\n' "$BLOCK" | grep -Fqx "NO_MORE_FINDINGS"; then
-              return 3
+            # Extract the outer ~~~~markdown block. Four tildes let the
+            # generated section safely contain normal triple-backtick
+            # code blocks without truncating the report.
+            local BLOCK
+            BLOCK=$(printf '%s\n' "$ASSISTANT" \
+              | awk '
+                  /^~~~~markdown[[:space:]]*$/ { if (!in_block) {in_block=1; next} }
+                  /^~~~~[[:space:]]*$/         { if (in_block) {exit} }
+                  in_block {print}
+                ')
+
+            if [ -z "$BLOCK" ]; then
+              echo "::warning::[$section_id] no ~~~~markdown block found; using raw assistant content."
+              BLOCK=$(printf '%s\n' "$ASSISTANT")
             fi
-            if [ -z "$continuation_file" ] && ! printf '%s\n' "$BLOCK" | grep -Fqx "# $section_heading"; then
-              echo "::warning::[$section_id] response is missing required heading: # $section_heading"
-              return 2
-            fi
-            if [ -n "$continuation_file" ] && ! printf '%s\n' "$BLOCK" | grep -Eq '^### VULN-[0-9]+'; then
-              echo "::warning::[$section_id] continuation contains no new VULN entry."
-              return 2
-            fi
-            if [ -n "$continuation_file" ] && ! printf '%s\n' "$BLOCK" | grep -Fqx "CONTINUE_FINDINGS"; then
-              echo "::warning::[$section_id] continuation omitted its completion marker."
+
+            if [ -z "$BLOCK" ]; then
+              echo "::error::[$section_id] block extraction produced empty content."
               return 2
             fi
 
             # Append the section. We wrap each section in HTML-style
             # comment markers so the outer loop can detect "this
             # section is present" by grepping for the BEGIN marker.
-            if [ -n "$continuation_file" ]; then
-              printf '\n%s\n' "$BLOCK" >> "$section_file"
-            else
-              {
-                echo
-                echo "<!-- BEGIN SECTION: $section_id -->"
-                printf '%s\n' "$BLOCK"
-                echo "<!-- END SECTION: $section_id -->"
-                echo
-              } >> "$section_file"
-            fi
+            {
+              echo
+              echo "<!-- BEGIN SECTION: $section_id -->"
+              printf '%s\n' "$BLOCK"
+              echo "<!-- END SECTION: $section_id -->"
+              echo
+            } >> "$section_file"
 
             echo "[$section_id] appended $(printf '%s' "$BLOCK" | wc -c) bytes"
-            return 0
-          }
-
-          do_vulnerability_pages() {
-            local section_file="$1"
-            local section_log="$2"
-            local page=1
-            local rc
-
-            if do_one_section "vulnerability_findings" \
-                              "Vulnerability Findings" \
-                              "$PROMPT_DIR/vulnerability_findings.txt" \
-                              "$section_file" \
-                              "$section_log"; then
-              :
-            else
-              echo "::error::Initial vulnerability page could not be generated."
-              return 1
-            fi
-
-            if ! grep -Eq '^(CONTINUE_FINDINGS|NO_MORE_FINDINGS)$' "$section_file"; then
-              echo "::error::Initial vulnerability page omitted its completion marker."
-              return 1
-            fi
-
-            while grep -Fqx "CONTINUE_FINDINGS" "$section_file"; do
-              if [ "$page" -ge "$VULNERABILITY_PAGE_LIMIT" ]; then
-                echo "::error::Vulnerability continuation exceeded $VULNERABILITY_PAGE_LIMIT pages."
-                return 1
-              fi
-              sed -i '/^CONTINUE_FINDINGS$/d' "$section_file"
-              page=$((page + 1))
-              echo "--- nvidia-scan: requesting vulnerability continuation page $page ---"
-              if do_one_section "vulnerability_findings" \
-                                "Vulnerability Findings" \
-                                "$PROMPT_DIR/vulnerability_continue.txt" \
-                                "$section_file" \
-                                "$section_log" \
-                                "$section_file"; then
-                continue
-              fi
-              rc=$?
-              if [ "$rc" = "3" ]; then
-                break
-              fi
-              echo "::error::Vulnerability continuation page $page could not be generated."
-              return 1
-            done
-            sed -i '/^NO_MORE_FINDINGS$/d' "$section_file"
             return 0
           }
 
@@ -470,7 +409,7 @@ jobs:
           PROMPT_EOF
 
           cat > "$PROMPT_DIR/vulnerability_findings.txt" <<'PROMPT_EOF'
-          Produce the '# Vulnerability Findings' section, covering as many findings as safely fit in this response. For EACH finding use this exact schema:
+          Produce ONLY the '# Vulnerability Findings' section. For EACH finding use this exact schema:
 
           ### VULN-<NNN> — <Vulnerability Name>
 
@@ -488,11 +427,7 @@ jobs:
           - **Business Impact:** <one paragraph>
           - **Confidence:** High | Medium | Low
 
-          Order findings Critical → High → Medium → Low. If additional findings remain after this batch, end with CONTINUE_FINDINGS on a line by itself. Otherwise end with NO_MORE_FINDINGS on a line by itself. Do NOT include any other section.
-          PROMPT_EOF
-
-          cat > "$PROMPT_DIR/vulnerability_continue.txt" <<'PROMPT_EOF'
-          Continue the existing Vulnerability Findings section with every remaining NEW finding that safely fits in this response, using the exact schema from the existing section. Do not repeat the '# Vulnerability Findings' heading and do not repeat any existing finding. If additional findings remain after this response, end with CONTINUE_FINDINGS on a line by itself. Otherwise end with NO_MORE_FINDINGS on a line by itself.
+          Order findings Critical → High → Medium → Low. If a check category yields no findings, you may omit it. Do NOT include any other section in your reply — just the findings, one after another, in the schema above.
           PROMPT_EOF
 
           cat > "$PROMPT_DIR/owasp_mapping.txt" <<'PROMPT_EOF'
@@ -567,27 +502,16 @@ jobs:
               missing_in_pass=$((missing_in_pass + 1))
               echo "[pass $pass] calling section '$slug' (attempt $((${RETRY_COUNT[$slug]} + 1)))"
 
-              if [ "$slug" = "vulnerability_findings" ]; then
-                if do_vulnerability_pages "$REPORT_PARTS" "$SECTION_LOG"; then
-                  rc=0
-                else
-                  rc=$?
-                fi
-              elif do_one_section "$slug" \
-                                  "$heading" \
-                                  "$PROMPT_DIR/${slug}.txt" \
-                                  "$REPORT_PARTS" \
-                                  "$SECTION_LOG"; then
-                rc=0
-              else
-                rc=$?
-              fi
-              if [ "$rc" = "0" ]; then
+              if do_one_section "$slug" \
+                                "$PROMPT_DIR/${slug}.txt" \
+                                "$REPORT_PARTS" \
+                                "$SECTION_LOG"; then
                 # Success — section is now in the report (the BEGIN
                 # marker is in place). Reset retry counter so a future
                 # failure won't immediately bail.
                 RETRY_COUNT["$slug"]=0
               else
+                rc=$?
                 if [ "$rc" = "1" ]; then
                   echo "::error::[$slug] hard failure; aborting run."
                   exit 1
