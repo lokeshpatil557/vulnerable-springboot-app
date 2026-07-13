@@ -56,7 +56,12 @@ jobs:
       REPORTS_DIR: .claude/reports
       SECTIONS_DIR: .claude/reports/sections
       ASSESSMENT_REPORT: .claude/reports/SECURITY_ASSESSMENT_REPORT.md
+      REMEDIATION_REPORT: .claude/reports/SECURE_REMEDIATION_REPORT.md
       PUSH_REPORT: .claude/reports/GIT_PUSH_REPORT.md
+    outputs:
+      remediation_applied: ${{ steps.nvidia_remediate.outputs.applied }}
+      remediation_build_status: ${{ steps.nvidia_remediate.outputs.build_status }}
+      remediation_files: ${{ steps.nvidia_remediate.outputs.files }}
 
     steps:
       - name: Checkout
@@ -693,6 +698,578 @@ jobs:
           cp "$SECTION_LOG" .claude/reports/nvidia-scan-transcript.log || true
           echo "Wrote $ASSESSMENT_REPORT ($REPORT_BYTES bytes). Job always completes — see warnings above for any degraded sections."
 
+      # -----------------------------------------------------------
+      # NVIDIA remediation agent — ONE API request.
+      #
+      #   Reads SECURITY_ASSESSMENT_REPORT.md + the body of every file
+      #   the report references + pom.xml, POSTs once to the NVIDIA
+      #   chat-completions endpoint, and expects TWO fenced blocks back:
+      #
+      #     ```nvidia-patches     — <path>@@@<body>@@@<path>@@@<body>...
+      #     ```markdown           — full contents of SECURE_REMEDIATION_REPORT.md
+      #
+      #   The workflow:
+      #     1. Parses the nvidia-patches block into <path, body> records.
+      #     2. Rejects unsafe paths (empty, absolute, contains '..', or
+      #        not on disk).
+      #     3. Writes each file via `cat > path <<'NVIDIA_PATCH_EOF'`.
+      #     4. Runs `mvn -B -q compile test-compile` as the build gate.
+      #     5. If the build breaks, `git checkout -- .` to revert the
+      #        entire batch and rewrite the report's leading line to
+      #        `Build verified: failed — all edits reverted`.
+      #     6. Writes the report (agent-supplied on success, placeholder
+      #        on parse failure / no API key).
+      #     7. Always sets step outputs:
+      #          applied       — number of patches applied (0 on failure)
+      #          build_status  — passed | reverted | parse_failed | skipped
+      #          files         — JSON array of applied file paths
+      #
+      #   The step NEVER aborts the job. Degraded outcomes are reported
+      #   as warnings and the push job continues with whatever the
+      #   assessment report alone would have produced.
+      # -----------------------------------------------------------
+      - name: nvidia-remediate
+        id: nvidia_remediate
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          SYSTEM_PROMPT_FILE: .claude/agents/nvidia-remediation-agent.md
+          MAX_REM_RETRIES: "3"
+          MAX_CONTINUATIONS: "4"
+          MIN_REPORT_WORDS: "20"
+        run: |
+          set -uo pipefail
+
+          # Outputs we will always set, even on the early-exit paths.
+          APPLIED=0
+          BUILD_STATUS="skipped"
+          FILES_JSON="[]"
+          REM_LOG=$(mktemp)
+
+          write_outputs() {
+            {
+              echo "applied=${APPLIED}"
+              echo "build_status=${BUILD_STATUS}"
+              echo "files=${FILES_JSON}"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          # Always emit outputs on exit, success or otherwise.
+          trap write_outputs EXIT
+
+          write_placeholder_report() {
+            local status_line="$1"
+            mkdir -p "$(dirname "$REMEDIATION_REPORT")"
+            {
+              echo "# Remediation Summary"
+              echo
+              echo "Build verified: ${status_line}"
+              echo
+              echo "## Total Findings by Severity"
+              echo "| Severity | Number of Findings |"
+              echo "| --- | --- |"
+              echo "| Critical | 0 |"
+              echo "| High | 0 |"
+              echo "| Medium | 0 |"
+              echo "| Low | 0 |"
+              echo
+              echo "## Build Verified"
+              echo "Build verified: ${status_line}"
+              echo
+              echo "## Changes Made"
+              echo "None"
+              echo
+              echo "## Changes That Remained — Due To Build Breakage"
+              echo "None"
+              echo
+              echo "## Files Referenced"
+              echo "None"
+              echo
+              echo "## Vulnerability Remediations"
+              echo "_No remediations were generated._"
+              echo
+              echo "## Security Improvements"
+              echo "_Not generated — see Build Verified line above._"
+              echo
+              echo "## Residual Risks"
+              echo "_Not generated — see Build Verified line above._"
+              echo
+              echo "## Secure Coding Recommendations"
+              echo "_Not generated — see Build Verified line above._"
+            } > "$REMEDIATION_REPORT"
+          }
+
+          # ------------------------------------------------------------
+          # 0. Early-exit paths: missing assessment report OR missing key.
+          #    Both produce a placeholder report + skipped status.
+          # ------------------------------------------------------------
+          if [ ! -s "$ASSESSMENT_REPORT" ]; then
+            echo "::warning::Assessment report missing or empty at $ASSESSMENT_REPORT; writing placeholder remediation report."
+            write_placeholder_report "not run — assessment report was missing"
+            BUILD_STATUS="skipped"
+            exit 0
+          fi
+
+          if [ -z "${NVIDIA_API_KEY:-}" ]; then
+            echo "::warning::NVIDIA_API_KEY repository secret is not set; writing placeholder remediation report."
+            write_placeholder_report "not run — NVIDIA_API_KEY missing"
+            BUILD_STATUS="skipped"
+            exit 0
+          fi
+
+          # ------------------------------------------------------------
+          # 1. Build the user payload.
+          #
+          #   a) full SECURITY_ASSESSMENT_REPORT.md
+          #   b) every file referenced by '** Affected File:**' lines in
+          #      vulnerability_findings.md (curated — exactly the files
+          #      the agent will be patching)
+          #   c) pom.xml
+          #
+          #   Per-file size cap = 16000 bytes (truncation marker), same
+          #   as the scan step.
+          # ------------------------------------------------------------
+          USER_PAYLOAD=$(mktemp)
+          {
+            echo "## SECURITY_ASSESSMENT_REPORT.md ($(wc -c < "$ASSESSMENT_REPORT") bytes)"
+            cat "$ASSESSMENT_REPORT"
+            echo
+            echo
+            echo "## Referenced source files (curated — exactly those named under '**Affected File:**')"
+            AFFECTED_PATHS=$(mktemp)
+            if [ -s "$SECTIONS_DIR/vulnerability_findings.md" ]; then
+              grep -oE '`[^`]+`' "$SECTIONS_DIR/vulnerability_findings.md" \
+                | tr -d '`' | sort -u > "$AFFECTED_PATHS"
+            else
+              grep -oE '`[^`]+`' "$ASSESSMENT_REPORT" | tr -d '`' | sort -u > "$AFFECTED_PATHS"
+            fi
+
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              if [ ! -f "$f" ]; then
+                echo
+                echo "### $f (NOT FOUND ON DISK — skipped)"
+                continue
+              fi
+              size=$(wc -c < "$f" 2>/dev/null || echo 0)
+              echo
+              echo "### $f (${size} bytes)"
+              if [ "$size" -gt 16000 ]; then
+                head -c 16000 "$f"
+                echo
+                echo "...FILE TRUNCATED at 16000 bytes..."
+              else
+                cat "$f"
+              fi
+            done < "$AFFECTED_PATHS"
+
+            rm -f "$AFFECTED_PATHS"
+
+            echo
+            echo
+            echo "## pom.xml ($(wc -c < pom.xml 2>/dev/null || echo 0) bytes)"
+            if [ -f pom.xml ]; then
+              cat pom.xml
+            else
+              echo "_pom.xml not found at repository root._"
+            fi
+          } > "$USER_PAYLOAD"
+
+          SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
+
+          echo "=== NVIDIA REMEDIATE: Preparing request ==="
+          echo "Payload size: $(wc -c < "$USER_PAYLOAD") bytes"
+          echo "Model: $NVIDIA_MODEL"
+
+          # ------------------------------------------------------------
+          # 2. call_nvidia — identical contract to the scan step.
+          # ------------------------------------------------------------
+          call_nvidia() {
+            local user_msg="$1" temp="$2"
+            local REQUEST_BODY RESPONSE_FILE HTTP_CODE
+            REQUEST_BODY=$(jq -n \
+              --arg model "$NVIDIA_MODEL" --arg sys "$SYSTEM_PROMPT" --arg user "$user_msg" \
+              --argjson temp "$temp" --argjson mtok "$NVIDIA_MAX_TOKENS" \
+              '{model:$model, temperature:$temp, max_tokens:$mtok,
+                messages:[{role:"system",content:$sys},{role:"user",content:$user}]}')
+            RESPONSE_FILE=$(mktemp)
+            HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" \
+              -H "Authorization: Bearer $NVIDIA_API_KEY" -H "Content-Type: application/json" \
+              --connect-timeout 60 --max-time 1500 \
+              --retry 5 --retry-delay 15 --retry-all-errors --retry-max-time 900 \
+              -X POST "$NVIDIA_BASE_URL" -d "$REQUEST_BODY" || echo "000")
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "::warning::NVIDIA call HTTP $HTTP_CODE — will retry, not aborting."
+              cat "$RESPONSE_FILE" || true
+              rm -f "$RESPONSE_FILE"
+              ASSISTANT=""
+              FINISH_REASON="error"
+              return 1
+            fi
+            ASSISTANT=$(jq -r '.choices[0].message.content // ""' "$RESPONSE_FILE")
+            FINISH_REASON=$(jq -r '.choices[0].finish_reason // ""' "$RESPONSE_FILE")
+            rm -f "$RESPONSE_FILE"
+            return 0
+          }
+
+          # ------------------------------------------------------------
+          # 3. Fence extractors. Strict-path first, lenient fallback so
+          #    we never drop a section entirely.
+          # ------------------------------------------------------------
+          extract_fence() {
+            # $1 = opening fence (e.g. '```nvidia-patches' or '```markdown')
+            # $2 = raw text
+            local open="$1" raw="$2"
+            printf '%s' "$raw" | awk -v open="$open" '
+              $0 == open { if (!in_block) {in_block=1; found=1; next} }
+              /^```[[:space:]]*$/ { if (in_block) {in_block=0; exit} }
+              in_block { print }
+              END { if (!found) exit 1 }
+            '
+          }
+
+          # ------------------------------------------------------------
+          # 4. One API call (with finish_reason=length continuations and
+          #    whole-call retries on transport failure). Mirrors the
+          #    shape of generate_section in the scan step.
+          # ------------------------------------------------------------
+          attempt=0
+          temp="$NVIDIA_TEMPERATURE"
+          call_failed=0
+          raw_accum=""
+          failure_note=""
+
+          while [ "$attempt" -lt "$MAX_REM_RETRIES" ]; do
+            attempt=$((attempt + 1))
+            echo "[remediate] attempt $attempt/$MAX_REM_RETRIES (temp=$temp)"
+
+            base_msg="$(cat "$USER_PAYLOAD")
+
+          ---
+
+          ${failure_note}
+
+          Emit EXACTLY two fenced code blocks, in this order, with NO text outside them:
+
+          1. A \`\`\`nvidia-patches block: zero or more \`<repo-relative-path>@@@<full new file body>@@@\` records.
+             - Use the literal \`@@@\` separator on its own line.
+             - Each body is the COMPLETE new file contents (first line to last line), ready to be written by \`cat > path <<'NVIDIA_PATCH_EOF' ... NVIDIA_PATCH_EOF\`.
+             - If a file needs no change, do not emit a record.
+             - If no findings are actionable, emit an empty block.
+
+          2. A \`\`\`markdown block: the full contents of SECURE_REMEDIATION_REPORT.md.
+             - It must start with the line \`Build verified: mvn compile test-compile passed\` (the workflow will rewrite this on failure paths).
+
+          Do NOT include any text outside the two fenced blocks. Stop after the second closing fence."
+
+            raw_accum=""
+            sub=0
+            msg="$base_msg"
+            call_failed=0
+
+            while [ "$sub" -lt "$MAX_CONTINUATIONS" ]; do
+              sub=$((sub + 1))
+              if ! call_nvidia "$msg" "$temp"; then
+                call_failed=1
+                break
+              fi
+              raw_accum+="$ASSISTANT"
+              {
+                echo "=== remediate attempt $attempt sub $sub (finish_reason=$FINISH_REASON) ==="
+                printf '%s\n' "$ASSISTANT" | head -c 2000
+                echo "--- END ---"
+              } >> "$REM_LOG"
+
+              if [ "$FINISH_REASON" != "length" ]; then break; fi
+
+              echo "[remediate] truncated, requesting continuation ($sub/$MAX_CONTINUATIONS)"
+              tail_ctx=$(printf '%s' "$raw_accum" | tail -c 2000)
+              msg="Continue EXACTLY where you left off. Do not repeat any text. Here is the end of what you already wrote:
+
+          ${tail_ctx}
+
+          Continue from immediately after that. When complete, close the second fenced block with the closing \`\`\` fence."
+            done
+
+            if [ "$call_failed" -eq 1 ]; then
+              echo "::warning::[remediate] API call failed on attempt $attempt; retrying."
+              failure_note="NOTE: the previous request failed; try again."
+              temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
+              continue
+            fi
+
+            if [ "$FINISH_REASON" = "length" ]; then
+              echo "::warning::[remediate] still truncated after $MAX_CONTINUATIONS continuations; retrying."
+              failure_note="NOTE: your previous attempt was truncated before completion. Be more concise per item so the full response fits."
+              temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
+              continue
+            fi
+
+            # Both blocks must be present for this attempt to count.
+            PATCHES_RAW=$(extract_fence '```nvidia-patches' "$raw_accum" || true)
+            REPORT_RAW=$(extract_fence '```markdown' "$raw_accum" || true)
+            if [ -z "$PATCHES_RAW" ] || [ -z "$REPORT_RAW" ]; then
+              echo "::warning::[remediate] missing one or both fenced blocks; retrying."
+              echo "::group::[remediate] raw output (first 1500 chars) — for diagnosis"
+              printf '%s\n' "$raw_accum" | head -c 1500
+              echo
+              echo "::endgroup::"
+              failure_note="NOTE: your previous attempt did not include BOTH fenced blocks (\`\`\`nvidia-patches ... \`\`\` and \`\`\`markdown ... \`\`\`) in the correct order. Emit exactly those two blocks, nothing else."
+              temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
+              continue
+            fi
+
+            wc_words=$(printf '%s' "$REPORT_RAW" | wc -w)
+            if [ "$wc_words" -lt "$MIN_REPORT_WORDS" ]; then
+              echo "::warning::[remediate] report block suspiciously short ($wc_words words); retrying."
+              failure_note="NOTE: your previous attempt's remediation report was too short. Produce the full report."
+              temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
+              continue
+            fi
+
+            # We have a usable response. Stop retrying.
+            break
+          done
+
+          # If every attempt failed at the API/validation layer, degrade.
+          if [ -z "${PATCHES_RAW:-}" ] || [ -z "${REPORT_RAW:-}" ]; then
+            echo "::warning::[remediate] exhausted $MAX_REM_RETRIES attempts; writing placeholder report."
+            write_placeholder_report "not run — agent output could not be parsed after $MAX_REM_RETRIES attempts"
+            cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+            BUILD_STATUS="parse_failed"
+            exit 0
+          fi
+
+          # ------------------------------------------------------------
+          # 5. Parse the patch block into <path, body> records.
+          #
+          #   The agent's spec (nvidia-remediation-agent.md) emits each
+          #   record as:
+          #
+          #     <path>
+          #     @@@                        <- between path and body
+          #     <body line 1>
+          #     <body line 2>
+          #     ...
+          #     @@@                        <- end of this record
+          #
+          #   So between two adjacent records there is a SINGLE '@@@'
+          #   line that serves double duty: end-of-body for the
+          #   previous record AND path-and-body-boundary for the next.
+          #   The state machine is:
+          #     phase=path  : the next non-separator line is the path;
+          #                   a separator switches to body phase.
+          #     phase=body  : the lines until the next separator are
+          #                   the body; a separator flushes the record
+          #                   and switches to path phase.
+          # ------------------------------------------------------------
+          echo "=== Parsing patch block ==="
+          PATCHES_APPLIED_LOG=$(mktemp)
+          APPLIED=0
+          FILES_JSON_TMP=$(mktemp)
+          echo "[" > "$FILES_JSON_TMP"
+          first=1
+
+          # Strip any '```nvidia-patches' / '```' lines (defensive — strict
+          # extractor should already have removed them, but be safe).
+          CLEAN=$(printf '%s' "$PATCHES_RAW" | grep -v '^```')
+
+          # Convert '@@@' separator lines into '<<<SEP>>>' tokens for
+          # the state machine to recognize.
+          ORDERED=$(printf '%s' "$CLEAN" | awk '
+            /^@@@[[:space:]]*$/ { print "<<<SEP>>>"; next }
+            { print }
+          ')
+
+          phase="path"
+          cur_path=""
+          cur_body=""
+          bad_records=0
+
+          flush_record() {
+            # Called when we hit '<<<SEP>>>' while in 'body' phase, or
+            # at end of stream. Validates cur_path and, if valid,
+            # records it for the build gate.
+            if [ -z "$cur_path" ]; then
+              bad_records=$((bad_records + 1))
+              cur_path=""; cur_body=""; phase="path"
+              return
+            fi
+            case "$cur_path" in
+              \"*|*\"|/*|../*|..|*/..|*/../*|*..*)
+                echo "::warning::[remediate] rejecting unsafe path: $cur_path"
+                bad_records=$((bad_records + 1))
+                cur_path=""; cur_body=""; phase="path"
+                return
+              ;;
+            esac
+            if [ ! -f "$cur_path" ]; then
+              echo "::warning::[remediate] path not on disk, skipping: $cur_path"
+              bad_records=$((bad_records + 1))
+              cur_path=""; cur_body=""; phase="path"
+              return
+            fi
+            echo "$cur_path" >> "$PATCHES_APPLIED_LOG"
+            cur_path=""; cur_body=""; phase="path"
+          }
+
+          while IFS= read -r line; do
+            if [ "$line" = "<<<SEP>>>" ]; then
+              if [ "$phase" = "body" ]; then
+                # End of current record's body. Flush it and switch
+                # to path phase.
+                flush_record
+              else
+                # phase=path: the separator is the path→body boundary.
+                # Switch to body phase without flushing.
+                phase="body"
+              fi
+            elif [ "$phase" = "path" ]; then
+              # First non-separator line in this record — the path.
+              cur_path="$line"
+            else
+              # phase=body: accumulate the line into the current
+              # record's body.
+              if [ -z "$cur_body" ]; then
+                cur_body="$line"
+              else
+                cur_body="${cur_body}"$'\n'"$line"
+              fi
+            fi
+          done <<< "$ORDERED"
+
+          # Trailing body without a closing '@@@'.
+          if [ "$phase" = "body" ] && [ -n "$cur_path" ]; then
+            flush_record
+          fi
+
+          if [ "$bad_records" -gt 0 ]; then
+            echo "::warning::[remediate] rejected $bad_records patch record(s) on validation."
+          fi
+
+          ATTEMPTED=$(wc -l < "$PATCHES_APPLIED_LOG" | tr -d ' ')
+          echo "[remediate] $ATTEMPTED patch record(s) validated and queued for apply."
+
+          if [ "$ATTEMPTED" -eq 0 ]; then
+            # Empty patch block is a normal outcome per the agent's spec.
+            echo "[remediate] no patches to apply (empty patch block — normal outcome)."
+            printf '%s' "$REPORT_RAW" > "$REMEDIATION_REPORT"
+            cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+            BUILD_STATUS="passed"
+            APPLIED=0
+            FILES_JSON="[]"
+            exit 0
+          fi
+
+          # ------------------------------------------------------------
+          # 6. Apply each patch. Re-run the same state machine to
+          #    extract <path, body> pairs and write each file.
+          # ------------------------------------------------------------
+          PATCH_DIR=$(mktemp -d)
+
+          idx=0
+          phase="path"
+          cur_path=""
+          cur_body=""
+          while IFS= read -r line; do
+            if [ "$line" = "<<<SEP>>>" ]; then
+              if [ "$phase" = "body" ]; then
+                # End of current record's body. Save it and reset.
+                if [ -n "$cur_path" ]; then
+                  idx=$((idx + 1))
+                  body_file="$PATCH_DIR/body-${idx}.txt"
+                  printf '%s\n' "$cur_body" > "$body_file"
+                  printf '%s\n' "$cur_path" > "$PATCH_DIR/path-${idx}.txt"
+                fi
+                cur_path=""; cur_body=""; phase="path"
+              else
+                # phase=path: separator is path→body boundary.
+                phase="body"
+              fi
+            elif [ "$phase" = "path" ]; then
+              cur_path="$line"
+            else
+              if [ -z "$cur_body" ]; then
+                cur_body="$line"
+              else
+                cur_body="${cur_body}"$'\n'"$line"
+              fi
+            fi
+          done <<< "$ORDERED"
+
+          # Trailing record (no closing '@@@').
+          if [ "$phase" = "body" ] && [ -n "$cur_path" ]; then
+            idx=$((idx + 1))
+            body_file="$PATCH_DIR/body-${idx}.txt"
+            printf '%s\n' "$cur_body" > "$body_file"
+            printf '%s\n' "$cur_path" > "$PATCH_DIR/path-${idx}.txt"
+          fi
+
+          # Write each file. The body is read into a bash variable and
+          # emitted with `printf '%s\n'` — '%s' is the safe format that
+          # never interprets '%' in the data, so the body is written
+          # byte-exact, no shell expansion of $, `, or \.
+          APPLIED=0
+          for body_file in "$PATCH_DIR"/body-*.txt; do
+            [ -e "$body_file" ] || continue
+            idx="${body_file##*body-}"; idx="${idx%.txt}"
+            path_file="$PATCH_DIR/path-${idx}.txt"
+            [ -e "$path_file" ] || continue
+            path=$(cat "$path_file")
+            [ -z "$path" ] && continue
+
+            echo "[remediate] applying patch: $path"
+            body=$(cat "$body_file")
+            if ! printf '%s\n' "$body" > "$path"; then
+              echo "::warning::[remediate] failed to write $path"
+              continue
+            fi
+            APPLIED=$((APPLIED + 1))
+            if [ "$first" -eq 1 ]; then
+              printf '"%s"' "$path" >> "$FILES_JSON_TMP"
+              first=0
+            else
+              printf ',"%s"' "$path" >> "$FILES_JSON_TMP"
+            fi
+          done
+          echo "]" >> "$FILES_JSON_TMP"
+          FILES_JSON=$(cat "$FILES_JSON_TMP")
+          rm -rf "$PATCH_DIR" "$FILES_JSON_TMP"
+
+          echo "[remediate] applied $APPLIED file(s)."
+
+          # ------------------------------------------------------------
+          # 7. Build gate.
+          # ------------------------------------------------------------
+          echo "=== Build gate: mvn -B -q compile test-compile ==="
+          if mvn -B -q compile test-compile; then
+            echo "=== Build gate: PASSED ==="
+            # Agent already wrote `Build verified: mvn compile test-compile passed`
+            # on its leading line; we just persist the report.
+            printf '%s' "$REPORT_RAW" > "$REMEDIATION_REPORT"
+            cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+            BUILD_STATUS="passed"
+          else
+            echo "::warning::[remediate] build gate FAILED — reverting all patches."
+            git checkout -- .
+            # Rewrite the report's leading line to signal the failure.
+            FAILED_REPORT=$(printf '%s' "$REPORT_RAW" | awk '
+              BEGIN { replaced = 0 }
+              /^Build verified:[[:space:]]*/ {
+                if (!replaced) { print "Build verified: failed — all edits reverted"; replaced = 1; next }
+              }
+              { print }
+            ')
+            if ! printf '%s' "$FAILED_REPORT" | grep -q '^Build verified:'; then
+              FAILED_REPORT="Build verified: failed — all edits reverted
+          ${FAILED_REPORT}"
+            fi
+            printf '%s' "$FAILED_REPORT" > "$REMEDIATION_REPORT"
+            cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+            BUILD_STATUS="reverted"
+            APPLIED=0
+            FILES_JSON="[]"
+          fi
+
       - name: Upload nvidia-scan transcript
         if: always() && hashFiles('.claude/reports/nvidia-scan-transcript.log') != ''
         uses: actions/upload-artifact@v4
@@ -717,11 +1294,28 @@ jobs:
           path: ${{ env.ASSESSMENT_REPORT }}
           retention-days: 90
 
+      - name: Upload nvidia-remediate transcript
+        if: always() && hashFiles('.claude/reports/nvidia-remediate-transcript.log') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvidia-remediate-transcript
+          path: .claude/reports/nvidia-remediate-transcript.log
+          retention-days: 30
+
+      - name: Upload secure remediation report
+        if: always() && hashFiles(env.REMEDIATION_REPORT) != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: secure-remediation-report
+          path: ${{ env.REMEDIATION_REPORT }}
+          retention-days: 90
+
       - name: Stage assessment working-tree changes
         run: |
           set -euo pipefail
           git add -A
           git add -f "$ASSESSMENT_REPORT" 2>/dev/null || true
+          git add -f "$REMEDIATION_REPORT" 2>/dev/null || true
           git add -f "$SECTIONS_DIR"/*.md 2>/dev/null || true
           git status --short
           echo "---"
@@ -732,6 +1326,9 @@ jobs:
         env:
           CHAIN_PREFIX: nvdia_trials
           DEVELOPMENT_BRANCH: nvdia_trials
+          REMEDIATION_APPLIED: ${{ steps.nvidia_remediate.outputs.applied }}
+          REMEDIATION_BUILD_STATUS: ${{ steps.nvidia_remediate.outputs.build_status }}
+          REMEDIATION_FILES_JSON: ${{ steps.nvidia_remediate.outputs.files }}
         run: |
           set -euo pipefail
 
@@ -739,6 +1336,17 @@ jobs:
             echo "::error::Assessment report missing or empty: $ASSESSMENT_REPORT. Aborting push."
             exit 1
           fi
+
+          # Read the remediation step's outputs (default to 0 / 'skipped' / '[]'
+          # if the step was skipped or earlier than expected).
+          APPLIED_COUNT="${REMEDIATION_APPLIED:-0}"
+          BUILD_STATUS_REM="${REMEDIATION_BUILD_STATUS:-skipped}"
+          REMEDIATION_FILES="${REMEDIATION_FILES_JSON:-[]}"
+          if ! printf '%s' "$REMEDIATION_FILES" | jq -e . >/dev/null 2>&1; then
+            REMEDIATION_FILES="[]"
+          fi
+          REMEDIATION_FILES_COUNT=$(printf '%s' "$REMEDIATION_FILES" | jq 'length' 2>/dev/null || echo 0)
+          echo "Remediation summary: applied=${APPLIED_COUNT} build_status=${BUILD_STATUS_REM} files=${REMEDIATION_FILES_COUNT}"
 
           if [ -z "$(git status --porcelain)" ]; then
             echo "Nothing to commit. Skipping push."
@@ -773,22 +1381,42 @@ jobs:
             exit 1
           fi
 
-          CHANGES_SUMMARY=$(awk '
-              /^# Findings/{flag=1; next}
-              /^# Executive Summary/{ if (!flag) flag=1; next }
-              /^# /{flag=0}
-              flag && NF{print}
-            ' "$ASSESSMENT_REPORT" \
-            | sed -nE 's/^[[:space:]]*[-*][[:space:]]*//p' \
-            | head -n 8 \
-            | sed 's/[\"]/\\&/g' \
-            | paste -sd '|' -)
-          if [ -z "$CHANGES_SUMMARY" ]; then
-            CHANGES_SUMMARY="automated security scan"
+          # Build the bullet list for the commit message. Prefer the
+          # remediation report's '## Changes Made' section when patches
+          # were applied; otherwise fall back to the assessment report's
+          # top-level findings.
+          BULLETS_RAW=""
+          if [ "${APPLIED_COUNT:-0}" -gt 0 ] && [ -s "$REMEDIATION_REPORT" ]; then
+            BULLETS_RAW=$(awk '
+                /^## Changes Made[[:space:]]*$/ { flag=1; next }
+                /^## /{ if (flag) exit; }
+                flag && NF { print }
+              ' "$REMEDIATION_REPORT" 2>/dev/null | head -n 8 || true)
           fi
-          BULLETS=$(printf '%s' "$CHANGES_SUMMARY" | tr '|' '\n' | sed 's/^/- /' | paste -sd '\n' -)
+          if [ -z "$BULLETS_RAW" ]; then
+            BULLETS_RAW=$(awk '
+                /^# Findings/{flag=1; next}
+                /^# Executive Summary/{ if (!flag) flag=1; next }
+                /^# /{flag=0}
+                flag && NF{print}
+              ' "$ASSESSMENT_REPORT" 2>/dev/null \
+              | sed -nE 's/^[[:space:]]*[-*][[:space:]]*//p' \
+              | head -n 8 || true)
+          fi
+          if [ -z "$BULLETS_RAW" ]; then
+            BULLETS_RAW="automated security scan"
+          fi
+          BULLETS=$(printf '%s\n' "$BULLETS_RAW" | sed 's/[\"]/\\&/g' | sed 's/^/- /' | paste -sd '\n' -)
 
-          SUBJECT="NVIDIA git-agent push #${NEW_N} — security scan report"
+          # Source line: report what actually happened in the remediation
+          # step so reviewers know whether this branch carries code changes.
+          if [ "${APPLIED_COUNT:-0}" -gt 0 ]; then
+            SOURCE_LINE="Source: SECURITY_ASSESSMENT_REPORT.md + SECURE_REMEDIATION_REPORT.md (Applied: ${APPLIED_COUNT} patch(es) over ${REMEDIATION_FILES_COUNT} file(s) — Build verified: mvn compile test-compile passed)"
+            SUBJECT="NVIDIA git-agent push #${NEW_N} — automated remediation"
+          else
+            SOURCE_LINE="Source: SECURITY_ASSESSMENT_REPORT.md (no code changes — remediation step reported: ${BUILD_STATUS_REM})"
+            SUBJECT="NVIDIA git-agent push #${NEW_N} — security scan report"
+          fi
           if [ "${#SUBJECT}" -gt 72 ]; then
             SUBJECT="NVIDIA git-agent push #${NEW_N} — scan report"
           fi
@@ -796,7 +1424,7 @@ jobs:
           COMMIT_MSG=$(printf '%s\n\n%s\n\n%s\n%s\n%s\n\n%s\n' \
             "$SUBJECT" \
             "$BULLETS" \
-            "Source: SECURITY_ASSESSMENT_REPORT.md (no code changes — remediation agent removed)" \
+            "$SOURCE_LINE" \
             "Parent branch: ${PARENT}" \
             "Manual merge target: ${DEVELOPMENT_BRANCH} (then main, human review required)" \
             "Co-Authored-By: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>")
@@ -817,6 +1445,7 @@ jobs:
           git stash pop || true
           git add -A
           git add -f "$ASSESSMENT_REPORT" 2>/dev/null || true
+          git add -f "$REMEDIATION_REPORT" 2>/dev/null || true
           git add -f "$SECTIONS_DIR"/*.md 2>/dev/null || true
 
           MSG_FILE=$(mktemp)
@@ -837,6 +1466,17 @@ jobs:
           REMOTE_URL=$(git remote get-url origin)
           git checkout "$PARENT"
 
+          # Files Pushed section: when patches were applied, list the
+          # patched source files explicitly so the reviewer can see the
+          # surface area; otherwise show the commit's `git show` stat.
+          if [ "${APPLIED_COUNT:-0}" -gt 0 ]; then
+            PUSHED_FILES=$(git show --stat --name-only --format="" "$COMMIT_SHA")
+            APPLIED_PATHS_LIST=$(printf '%s' "$REMEDIATION_FILES" | jq -r '.[]' 2>/dev/null || true)
+          else
+            PUSHED_FILES=$(git show --stat --name-only --format="" "$COMMIT_SHA")
+            APPLIED_PATHS_LIST=""
+          fi
+
           {
             echo "# Git Push Report — NVIDIA git-agent Push #${NEW_N}"
             echo
@@ -845,12 +1485,29 @@ jobs:
             echo "- **Push branch:** \`${NEW_BRANCH}\`"
             echo "- **Push time:** ${TS}"
             echo "- **Remote:** origin (${REMOTE_URL})"
-            echo "- **Commit:** ${COMMIT_SHA}"
-            echo "- **Code changes:** none (remediation agent removed; only the assessment report is committed)"
-            echo
-            echo "## Files Pushed"
-            echo
-            git show --stat --name-only --format="" "$COMMIT_SHA" | sed 's/^/- /'
+            echo "- **Commit:** \`${COMMIT_SHA}\`"
+            if [ "${APPLIED_COUNT:-0}" -gt 0 ]; then
+              echo "- **Code changes:** ${APPLIED_COUNT} patch(es) over ${REMEDIATION_FILES_COUNT} file(s) — Build verified: mvn compile test-compile passed"
+              echo "- **Build status:** ${BUILD_STATUS_REM}"
+              echo
+              echo "## Patched Source Files"
+              echo
+              if [ -n "$APPLIED_PATHS_LIST" ]; then
+                printf '%s\n' "$APPLIED_PATHS_LIST" | sed 's/^/- `/; s/$/`/'
+              else
+                printf '%s\n' "$PUSHED_FILES" | sed 's/^/- `/; s/$/`/'
+              fi
+              echo
+              echo "## All Files Pushed"
+              echo
+              printf '%s\n' "$PUSHED_FILES" | sed 's/^/- `/; s/$/`/'
+            else
+              echo "- **Code changes:** none (remediation step reported: ${BUILD_STATUS_REM}; only the assessment report is committed)"
+              echo
+              echo "## Files Pushed"
+              echo
+              printf '%s\n' "$PUSHED_FILES" | sed 's/^/- `/; s/$/`/'
+            fi
           } > "$PUSH_REPORT"
 
           echo "Pushed: $NEW_BRANCH @ $COMMIT_SHA"
@@ -866,7 +1523,7 @@ jobs:
           retention-days: 90
 
       - name: Commit assessment report back to trigger branch
-        if: always() && hashFiles(env.ASSESSMENT_REPORT) != ''
+        if: always() && (hashFiles(env.ASSESSMENT_REPORT) != '' || hashFiles(env.REMEDIATION_REPORT) != '')
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
@@ -892,11 +1549,12 @@ jobs:
           git fetch origin "$TRIGGER_BRANCH" 2>/dev/null || true
           git checkout "$TRIGGER_BRANCH"
 
-          git add -f "$ASSESSMENT_REPORT"
+          git add -f "$ASSESSMENT_REPORT" 2>/dev/null || true
+          git add -f "$REMEDIATION_REPORT" 2>/dev/null || true
           git add -f "$SECTIONS_DIR"/*.md 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No report changes to commit on $TRIGGER_BRANCH."
           else
-            git commit -m "chore(security): refresh SECURITY_ASSESSMENT_REPORT.md [skip ci]"
+            git commit -m "chore(security): refresh SECURITY_ASSESSMENT_REPORT.md + SECURE_REMEDIATION_REPORT.md [skip ci]"
             git push origin "$TRIGGER_BRANCH"
           fi
