@@ -736,6 +736,13 @@ jobs:
           MAX_REM_RETRIES: "3"
           MAX_CONTINUATIONS: "4"
           MIN_REPORT_WORDS: "20"
+          # Per-request max_tokens. The single 12000-token request was
+          # producing HTTP 504s on llama-3.1-70b, so we split the
+          # remediation step into 3 smaller requests, each with its own
+          # output budget sized to the job.
+          REM_MAX_TOKENS_PATCHES: "4000"
+          REM_MAX_TOKENS_REPORT_A: "4000"
+          REM_MAX_TOKENS_REPORT_B: "6000"
         run: |
           set -uo pipefail
 
@@ -881,14 +888,16 @@ jobs:
           echo "Model: $NVIDIA_MODEL"
 
           # ------------------------------------------------------------
-          # 2. call_nvidia — identical contract to the scan step.
+          # 2. call_nvidia — identical contract to the scan step, but
+          #    takes a per-call max_tokens override so the three
+          #    remediation requests can use different output budgets.
           # ------------------------------------------------------------
           call_nvidia() {
-            local user_msg="$1" temp="$2"
+            local user_msg="$1" temp="$2" mtok="${3:-$NVIDIA_MAX_TOKENS}"
             local REQUEST_BODY RESPONSE_FILE HTTP_CODE
             REQUEST_BODY=$(jq -n \
               --arg model "$NVIDIA_MODEL" --arg sys "$SYSTEM_PROMPT" --arg user "$user_msg" \
-              --argjson temp "$temp" --argjson mtok "$NVIDIA_MAX_TOKENS" \
+              --argjson temp "$temp" --argjson mtok "$mtok" \
               '{model:$model, temperature:$temp, max_tokens:$mtok,
                 messages:[{role:"system",content:$sys},{role:"user",content:$user}]}')
             RESPONSE_FILE=$(mktemp)
@@ -928,112 +937,129 @@ jobs:
           }
 
           # ------------------------------------------------------------
-          # 4. One API call (with finish_reason=length continuations and
-          #    whole-call retries on transport failure). Mirrors the
-          #    shape of generate_section in the scan step.
+          # 4. call_with_retries <user_msg> <max_tokens> <label>
+          #                   <fence_open> <min_words>
+          #
+          #    Runs the chat-completions request with the same
+          #    0.0/0.2/0.4 temperature ladder, finish_reason=length
+          #    continuations, and per-attempt failure_note that the old
+          #    inline loop had. Returns the extracted fenced block on
+          #    stdout; returns 1 if every attempt failed validation.
+          #
+          #    Mirrors the shape of generate_section in the scan step.
           # ------------------------------------------------------------
-          attempt=0
-          temp="$NVIDIA_TEMPERATURE"
-          call_failed=0
-          raw_accum=""
-          failure_note=""
+          call_with_retries() {
+            local user_msg="$1" max_tokens="$2" label="$3" fence_open="$4" min_words="${5:-0}"
+            local attempt=0 temp="$NVIDIA_TEMPERATURE" failure_note=""
+            local raw_accum=""
 
-          while [ "$attempt" -lt "$MAX_REM_RETRIES" ]; do
-            attempt=$((attempt + 1))
-            echo "[remediate] attempt $attempt/$MAX_REM_RETRIES (temp=$temp)"
+            while [ "$attempt" -lt "$MAX_REM_RETRIES" ]; do
+              attempt=$((attempt + 1))
+              echo "[$label] attempt $attempt/$MAX_REM_RETRIES (temp=$temp, max_tokens=$max_tokens)"
 
-            base_msg="$(cat "$USER_PAYLOAD")
+              local base_msg="${user_msg}
 
           ---
 
           ${failure_note}
 
-          Emit EXACTLY two fenced code blocks, in this order, with NO text outside them:
+          Emit ONLY the ${fence_open} fenced code block. Do NOT emit any other fenced block. Do NOT include any text outside the single fenced block. Close with the literal \`\`\` fence."
 
-          1. A \`\`\`nvidia-patches block: zero or more \`<repo-relative-path>@@@<full new file body>@@@\` records.
-             - Use the literal \`@@@\` separator on its own line.
-             - Each body is the COMPLETE new file contents (first line to last line), ready to be written by \`cat > path <<'NVIDIA_PATCH_EOF' ... NVIDIA_PATCH_EOF\`.
-             - If a file needs no change, do not emit a record.
-             - If no findings are actionable, emit an empty block.
+              raw_accum=""
+              local sub=0 msg="$base_msg" call_failed=0
+              while [ "$sub" -lt "$MAX_CONTINUATIONS" ]; do
+                sub=$((sub + 1))
+                if ! call_nvidia "$msg" "$temp" "$max_tokens"; then
+                  call_failed=1
+                  break
+                fi
+                raw_accum+="$ASSISTANT"
+                {
+                  echo "=== $label attempt $attempt sub $sub (finish_reason=$FINISH_REASON) ==="
+                  printf '%s\n' "$ASSISTANT" | head -c 2000
+                  echo "--- END ---"
+                } >> "$REM_LOG"
 
-          2. A \`\`\`markdown block: the full contents of SECURE_REMEDIATION_REPORT.md.
-             - It must start with the line \`Build verified: mvn compile test-compile passed\` (the workflow will rewrite this on failure paths).
+                if [ "$FINISH_REASON" != "length" ]; then break; fi
 
-          Do NOT include any text outside the two fenced blocks. Stop after the second closing fence."
-
-            raw_accum=""
-            sub=0
-            msg="$base_msg"
-            call_failed=0
-
-            while [ "$sub" -lt "$MAX_CONTINUATIONS" ]; do
-              sub=$((sub + 1))
-              if ! call_nvidia "$msg" "$temp"; then
-                call_failed=1
-                break
-              fi
-              raw_accum+="$ASSISTANT"
-              {
-                echo "=== remediate attempt $attempt sub $sub (finish_reason=$FINISH_REASON) ==="
-                printf '%s\n' "$ASSISTANT" | head -c 2000
-                echo "--- END ---"
-              } >> "$REM_LOG"
-
-              if [ "$FINISH_REASON" != "length" ]; then break; fi
-
-              echo "[remediate] truncated, requesting continuation ($sub/$MAX_CONTINUATIONS)"
-              tail_ctx=$(printf '%s' "$raw_accum" | tail -c 2000)
-              msg="Continue EXACTLY where you left off. Do not repeat any text. Here is the end of what you already wrote:
+                echo "[$label] truncated, requesting continuation ($sub/$MAX_CONTINUATIONS)"
+                local tail_ctx
+                tail_ctx=$(printf '%s' "$raw_accum" | tail -c 2000)
+                msg="Continue EXACTLY where you left off. Do not repeat any text. Here is the end of what you already wrote:
 
           ${tail_ctx}
 
-          Continue from immediately after that. When complete, close the second fenced block with the closing \`\`\` fence."
+          Continue from immediately after that. When complete, close the fenced block with the closing \`\`\` fence."
+              done
+
+              if [ "$call_failed" -eq 1 ]; then
+                echo "::warning::[$label] API call failed on attempt $attempt; retrying."
+                failure_note="NOTE: the previous request failed; try again."
+                temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
+                continue
+              fi
+
+              if [ "$FINISH_REASON" = "length" ]; then
+                echo "::warning::[$label] still truncated after $MAX_CONTINUATIONS continuations; retrying."
+                failure_note="NOTE: your previous attempt was truncated before completion. Be more concise so the full response fits."
+                temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
+                continue
+              fi
+
+              local BLOCK
+              if ! BLOCK=$(extract_fence "$fence_open" "$raw_accum"); then
+                echo "::warning::[$label] no valid ${fence_open} fence found; retrying."
+                echo "::group::[$label] raw output (first 1500 chars) — for diagnosis"
+                printf '%s\n' "$raw_accum" | head -c 1500
+                echo
+                echo "::endgroup::"
+                failure_note="NOTE: your previous attempt did not wrap the content in the exact ${fence_open} / \`\`\` fence. Start your reply with the literal line ${fence_open} and end it with the literal line \`\`\` — nothing before or after."
+                temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
+                continue
+              fi
+
+              local wc_words
+              wc_words=$(printf '%s' "$BLOCK" | wc -w)
+              if [ "$min_words" -gt 0 ] && [ "$wc_words" -lt "$min_words" ]; then
+                echo "::warning::[$label] suspiciously short ($wc_words words, need >=$min_words); retrying."
+                failure_note="NOTE: your previous attempt was too short. Produce the full content."
+                temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
+                continue
+              fi
+
+              printf '%s' "$BLOCK"
+              return 0
             done
 
-            if [ "$call_failed" -eq 1 ]; then
-              echo "::warning::[remediate] API call failed on attempt $attempt; retrying."
-              failure_note="NOTE: the previous request failed; try again."
-              temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
-              continue
-            fi
+            return 1
+          }
 
-            if [ "$FINISH_REASON" = "length" ]; then
-              echo "::warning::[remediate] still truncated after $MAX_CONTINUATIONS continuations; retrying."
-              failure_note="NOTE: your previous attempt was truncated before completion. Be more concise per item so the full response fits."
-              temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
-              continue
-            fi
+          # ------------------------------------------------------------
+          # 5. Three API requests. Each is a smaller, focused call.
+          #
+          #   Request 1 — patches only
+          #   Request 2 — report sections 1–4 (Remediation Summary,
+          #                Changes Made, Changes That Remained,
+          #                Files Referenced)
+          #   Request 3 — report sections 5–8 (Vulnerability
+          #                Remediations, Security Improvements,
+          #                Residual Risks, Secure Coding
+          #                Recommendations)
+          #
+          #   Requests 2 and 3 only run on the build-passed path.
+          # ------------------------------------------------------------
+          PATCHES_PROMPT="$(cat "$USER_PAYLOAD")
 
-            # Both blocks must be present for this attempt to count.
-            PATCHES_RAW=$(extract_fence '```nvidia-patches' "$raw_accum" || true)
-            REPORT_RAW=$(extract_fence '```markdown' "$raw_accum" || true)
-            if [ -z "$PATCHES_RAW" ] || [ -z "$REPORT_RAW" ]; then
-              echo "::warning::[remediate] missing one or both fenced blocks; retrying."
-              echo "::group::[remediate] raw output (first 1500 chars) — for diagnosis"
-              printf '%s\n' "$raw_accum" | head -c 1500
-              echo
-              echo "::endgroup::"
-              failure_note="NOTE: your previous attempt did not include BOTH fenced blocks (\`\`\`nvidia-patches ... \`\`\` and \`\`\`markdown ... \`\`\`) in the correct order. Emit exactly those two blocks, nothing else."
-              temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
-              continue
-            fi
+          ---
 
-            wc_words=$(printf '%s' "$REPORT_RAW" | wc -w)
-            if [ "$wc_words" -lt "$MIN_REPORT_WORDS" ]; then
-              echo "::warning::[remediate] report block suspiciously short ($wc_words words); retrying."
-              failure_note="NOTE: your previous attempt's remediation report was too short. Produce the full report."
-              temp=$(awk -v t="$temp" 'BEGIN{printf "%.1f", (t+0.2>0.9)?0.9:t+0.2}')
-              continue
-            fi
+          Emit ONLY the \`\`\`nvidia-patches fenced code block. The block must contain zero or more \`<repo-relative-path>@@@<full new file body>@@@\` records, separated by literal \`@@@\` lines on their own. Each body is the COMPLETE new file contents (first line to last line), ready to be written by \`cat > path <<'NVIDIA_PATCH_EOF' ... NVIDIA_PATCH_EOF\`. If a file needs no change, do not emit a record. If no findings are actionable, emit an empty block."
 
-            # We have a usable response. Stop retrying.
-            break
-          done
-
-          # If every attempt failed at the API/validation layer, degrade.
-          if [ -z "${PATCHES_RAW:-}" ] || [ -z "${REPORT_RAW:-}" ]; then
-            echo "::warning::[remediate] exhausted $MAX_REM_RETRIES attempts; writing placeholder report."
-            write_placeholder_report "not run — agent output could not be parsed after $MAX_REM_RETRIES attempts"
+          echo "=== NVIDIA REMEDIATE: Request 1/3 (patches) ==="
+          PATCHES_RAW=""
+          PATCHES_RAW=$(call_with_retries "$PATCHES_PROMPT" "$REM_MAX_TOKENS_PATCHES" "remediate-patches" '```nvidia-patches' 0) || PATCHES_RAW=""
+          if [ -z "$PATCHES_RAW" ]; then
+            echo "::warning::[remediate] request 1 exhausted retries; writing placeholder report."
+            write_placeholder_report "not run — patches request could not be parsed after $MAX_REM_RETRIES attempts"
             cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
             BUILD_STATUS="parse_failed"
             exit 0
@@ -1151,8 +1177,35 @@ jobs:
 
           if [ "$ATTEMPTED" -eq 0 ]; then
             # Empty patch block is a normal outcome per the agent's spec.
+            # No build gate to run, no report requests to send — write a
+            # minimal "no actionable findings" report locally.
             echo "[remediate] no patches to apply (empty patch block — normal outcome)."
-            printf '%s' "$REPORT_RAW" > "$REMEDIATION_REPORT"
+            {
+              echo "Build verified: mvn compile test-compile passed"
+              echo
+              echo "# Remediation Summary"
+              echo
+              echo "## Changes Made"
+              echo "None — the agent emitted an empty \`nvidia-patches\` block."
+              echo
+              echo "## Changes That Remained — Due To Build Breakage"
+              echo "None"
+              echo
+              echo "## Files Referenced"
+              echo "None"
+              echo
+              echo "## Vulnerability Remediations"
+              echo "_No actionable remediations were generated. The original findings in SECURITY_ASSESSMENT_REPORT.md remain in the codebase._"
+              echo
+              echo "## Security Improvements"
+              echo "None — no source changes were made."
+              echo
+              echo "## Residual Risks"
+              echo "All findings from SECURITY_ASSESSMENT_REPORT.md are still present in the codebase and require manual remediation."
+              echo
+              echo "## Secure Coding Recommendations"
+              echo "Refer to SECURITY_ASSESSMENT_REPORT.md and the OWASP Top 10 mapping for the recommended secure-by-default patterns."
+            } > "$REMEDIATION_REPORT"
             cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
             BUILD_STATUS="passed"
             APPLIED=0
@@ -1243,27 +1296,159 @@ jobs:
           echo "=== Build gate: mvn -B -q compile test-compile ==="
           if mvn -B -q compile test-compile; then
             echo "=== Build gate: PASSED ==="
-            # Agent already wrote `Build verified: mvn compile test-compile passed`
-            # on its leading line; we just persist the report.
-            printf '%s' "$REPORT_RAW" > "$REMEDIATION_REPORT"
-            cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+            # Patches are on disk. Now run requests 2 and 3 to
+            # generate the remediation report, then merge into one file.
             BUILD_STATUS="passed"
+
+            # ------------------------------------------------------------
+            # 7a. Build a SMALL payload for the report requests. The
+            #     full SECURITY_ASSESSMENT_REPORT.md is ~72 KB and
+            #     embedding it again would re-trigger the same 504s we
+            #     are trying to avoid. Instead, parse the report
+            #     locally to extract just the structured fields the
+            #     model needs to write per-finding narratives:
+            #       VULN-NNN | CWE | OWASP category | Severity
+            #     plus the patch summary from the files we just wrote.
+            #     This is the same parsing logic the scan step uses
+            #     for its dependent sections.
+            # ------------------------------------------------------------
+            PARSED_LIST=$(awk '
+              /^### VULN-[0-9]+/      { id=$2; sub(/^VULN-/,"",id); vid="VULN-"id }
+              /\*\*CWE:\*\*/          { cwe=$0; sub(/.*\*\*CWE:\*\* */,"",cwe) }
+              /\*\*OWASP Top 10:\*\*/ { owasp=$0; sub(/.*\*\*OWASP Top 10:\*\* */,"",owasp) }
+              /\*\*Severity:\*\*/     { sev=$0; sub(/.*\*\*Severity:\*\* */,"",sev);
+                                         print vid " | " cwe " | " owasp " | " sev }
+            ' "$ASSESSMENT_REPORT")
+            TOTAL_FINDINGS=$(printf '%s\n' "$PARSED_LIST" | grep -c . || echo 0)
+            CRIT_COUNT=$(printf '%s\n' "$PARSED_LIST" | grep -ic 'Critical' || true)
+            HIGH_COUNT=$(printf '%s\n' "$PARSED_LIST" | grep -ic ' High' || true)
+            MED_COUNT=$(printf '%s\n' "$PARSED_LIST"  | grep -ic 'Medium'  || true)
+            LOW_COUNT=$(printf '%s\n' "$PARSED_LIST"  | grep -ic ' Low'    || true)
+
+            PATCH_SUMMARY=$(mktemp)
+            for p in $(printf '%s' "$FILES_JSON" | jq -r '.[]' 2>/dev/null || true); do
+              [ -z "$p" ] && continue
+              [ -f "$p" ] || continue
+              # First non-blank, non-package, non-import line — typically
+              # a class declaration or a comment that explains the file.
+              one_liner=$(awk '
+                /^[[:space:]]*$/ { next }
+                /^[[:space:]]*package[[:space:]]/ { next }
+                /^[[:space:]]*import[[:space:]]/ { next }
+                { print; exit }
+              ' "$p" | sed -E 's/^[[:space:]]+//' | head -c 200)
+              echo "- \`${p}\`: ${one_liner}" >> "$PATCH_SUMMARY"
+            done
+            if [ ! -s "$PATCH_SUMMARY" ]; then
+              echo "- (no patch summary available)" > "$PATCH_SUMMARY"
+            fi
+
+            REPORT_PROMPT="## Finding counts (use these exact numbers)
+          Critical: ${CRIT_COUNT} | High: ${HIGH_COUNT} | Medium: ${MED_COUNT} | Low: ${LOW_COUNT}
+          Total findings: ${TOTAL_FINDINGS}
+
+          ## Findings list (use ONLY these VULN-IDs, do not invent more)
+          Format: VULN-ID | CWE | OWASP category | Severity
+
+          ${PARSED_LIST}
+
+          ## Patches already applied (do NOT re-emit code in your reply; the file bodies are on disk)
+
+          The following source files have ALREADY been patched on disk by the workflow. Do not produce a \`nvidia-patches\` block; do not re-emit file bodies. Just describe what was changed, one bullet per file. The patches compile cleanly (mvn compile test-compile passed).
+
+          $(cat "$PATCH_SUMMARY")
+
+          ---
+
+          ## Required 8-section structure of SECURE_REMEDIATION_REPORT.md (mirror exactly)
+
+          1. \`# Remediation Summary\` — total findings, Applied count, breakdown by severity, headline outcome. First line MUST be \`Build verified: mvn compile test-compile passed\`.
+          2. \`# Changes Made\` — bullet list of every concrete edit (one per Applied finding).
+          3. \`# Changes That Remained — Due To Build Breakage\` — use \`None\` when none.
+          4. \`# Files Referenced\` — list of every repo-relative file path that was patched, with a one-line reason per edit. Use \`None\` when no patches.
+          5. \`# Vulnerability Remediations\` — one subsection per finding using the schema from your system prompt.
+          6. \`# Security Improvements\` — cross-cutting gains.
+          7. \`# Residual Risks\` — Skipped findings, dependency upgrades, password migrations.
+          8. \`# Secure Coding Recommendations\` — durable guardrails."
+
+            echo "=== NVIDIA REMEDIATE: Request 2/3 (report sections 1-4) ==="
+            REPORT_PART_A=""
+            REPORT_PART_A=$(call_with_retries "${REPORT_PROMPT}
+
+          ---
+
+          Emit ONLY the first 4 sections of the \`\`\`markdown fenced code block, in this exact order:
+
+          1. \`# Remediation Summary\` (first line MUST be \`Build verified: mvn compile test-compile passed\`)
+          2. \`# Changes Made\`
+          3. \`# Changes That Remained — Due To Build Breakage\`
+          4. \`# Files Referenced\`
+
+          Do NOT emit sections 5-8. Do NOT emit the \`nvidia-patches\` block. Do NOT include any text outside the single fenced block." \
+              "$REM_MAX_TOKENS_REPORT_A" "remediate-report-a" '```markdown' "$MIN_REPORT_WORDS") || REPORT_PART_A=""
+            if [ -z "$REPORT_PART_A" ]; then
+              echo "::warning::[remediate] request 2 exhausted retries; patches ARE applied, writing placeholder report."
+              write_placeholder_report "mvn compile test-compile passed (patches applied) — report part A could not be parsed after $MAX_REM_RETRIES attempts"
+              cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+              exit 0
+            fi
+
+            # Build a small tail context from part A so request 3 does
+            # not duplicate the leading line.
+            PART_A_TAIL=$(printf '%s' "$REPORT_PART_A" | tail -c 800)
+
+            echo "=== NVIDIA REMEDIATE: Request 3/3 (report sections 5-8) ==="
+            REPORT_PART_B=""
+            REPORT_PART_B=$(call_with_retries "${REPORT_PROMPT}
+
+          ---
+
+          For context, here is the tail end of what request 2 just produced (so you do not duplicate the leading line or sections 1-4):
+
+          ${PART_A_TAIL}
+
+          ---
+
+          Emit ONLY sections 5-8 of the \`\`\`markdown fenced code block, in this exact order:
+
+          5. \`# Vulnerability Remediations\`
+          6. \`# Security Improvements\`
+          7. \`# Residual Risks\`
+          8. \`# Secure Coding Recommendations\`
+
+          Do NOT emit sections 1-4. Do NOT emit the \`nvidia-patches\` block. Do NOT include any text outside the single fenced block." \
+              "$REM_MAX_TOKENS_REPORT_B" "remediate-report-b" '```markdown' "$MIN_REPORT_WORDS") || REPORT_PART_B=""
+            if [ -z "$REPORT_PART_B" ]; then
+              echo "::warning::[remediate] request 3 exhausted retries; patches ARE applied, writing placeholder report."
+              write_placeholder_report "mvn compile test-compile passed (patches applied) — report part B could not be parsed after $MAX_REM_RETRIES attempts"
+              cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+              exit 0
+            fi
+
+            # ------------------------------------------------------------
+            # 7b. Concatenate REPORT_PART_A + REPORT_PART_B into one
+            #     report. Defensive: if the model re-emitted
+            #     `# Remediation Summary` at the top of part B, drop it.
+            # ------------------------------------------------------------
+            REPORT_PART_B=$(printf '%s\n' "$REPORT_PART_B" | awk '
+              BEGIN { skipped_header = 0 }
+              !skipped_header && /^[[:space:]]*$/ { print; next }
+              !skipped_header && /^# Remediation Summary[[:space:]]*$/ { skipped_header = 1; next }
+              { print }
+            ')
+            {
+              printf '%s\n' "$REPORT_PART_A"
+              printf '%s\n' "$REPORT_PART_B"
+            } > "$REMEDIATION_REPORT"
+            rm -f "$PATCH_SUMMARY"
+            cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+            echo "Wrote $REMEDIATION_REPORT ($(wc -c < "$REMEDIATION_REPORT") bytes)."
           else
             echo "::warning::[remediate] build gate FAILED — reverting all patches."
             git checkout -- .
-            # Rewrite the report's leading line to signal the failure.
-            FAILED_REPORT=$(printf '%s' "$REPORT_RAW" | awk '
-              BEGIN { replaced = 0 }
-              /^Build verified:[[:space:]]*/ {
-                if (!replaced) { print "Build verified: failed — all edits reverted"; replaced = 1; next }
-              }
-              { print }
-            ')
-            if ! printf '%s' "$FAILED_REPORT" | grep -q '^Build verified:'; then
-              FAILED_REPORT="Build verified: failed — all edits reverted
-          ${FAILED_REPORT}"
-            fi
-            printf '%s' "$FAILED_REPORT" > "$REMEDIATION_REPORT"
+            # No API calls on the failure path — write the report locally
+            # with the standard "failed — all edits reverted" leading line.
+            write_placeholder_report "failed — all edits reverted"
             cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
             BUILD_STATUS="reverted"
             APPLIED=0
