@@ -59,6 +59,7 @@ The assessment identified a total of 7 findings, categorized by severity as foll
 - Low: 2
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 =======
 Total findings: 7
 >>>>>>> Stashed changes
@@ -95,4 +96,7 @@ The OWASP Top 10 (2021) Vulnerability Lab is intentionally insecure, and this as
 >>>>>>> Stashed changes
 =======
 These findings highlight the need for immediate attention and remediation to ensure the application's security and protect against potential attacks.
+>>>>>>> Stashed changes
+=======
+Total findings: 7
 >>>>>>> Stashed changes

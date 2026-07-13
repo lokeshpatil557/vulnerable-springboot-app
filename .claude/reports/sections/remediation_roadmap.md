@@ -3,6 +3,7 @@
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 1. **VULN-001**: Update `UserService.findByUsernameUnsafe` to use a parameterized query instead of string concatenation to prevent SQL injection. Ensure that the `username` parameter is properly sanitized and validated before being used in the query. Implement input validation to prevent malicious input from reaching the database.
 
 2. **VULN-002**: Update `CommentController.save` to use a prepared statement with parameterized queries to prevent SQL injection. Ensure that user input is properly sanitized and validated before being used in the query.
@@ -93,4 +94,25 @@
 1. **Implement parameterized SQL queries**: Update all SQL queries to use parameterized queries to prevent SQL injection attacks.
 2. **Implement proper access controls**: Ensure that all sensitive data and functionality is properly protected with access controls, such as authentication and authorization mechanisms.
 3. **Implement secure cryptographic practices**: Update all cryptographic practices to use secure algorithms and protocols, such as secure password hashing and secure data storage.
+>>>>>>> Stashed changes
+=======
+1. **VULN-001**: Fix SQL injection vulnerability in `UserService.findByUsernameUnsafe` by using parameterized queries. Update the `findByUsername` method to use a `@Query` annotation with a parameterized query. Ensure that the query is properly escaped to prevent SQL injection attacks.
+
+2. **VULN-002**: Fix stored XSS vulnerability in `CommentController.save` by properly escaping user input. Update the `save` method to use `HtmlUtils.htmlEscape` to escape any user-controlled input before storing it in the database.
+
+3. **VULN-003**: Fix broken access control vulnerability in `UIController.doTransfer` by implementing proper authorization checks. Update the `doTransfer` method to check if the user has the necessary permissions before allowing the transfer.
+
+4. **VULN-004**: Fix cryptographic failures vulnerability in `application.properties` by properly securing sensitive data. Update the `application.properties` file to use environment variables or a secure secrets manager to store sensitive data.
+
+5. **VULN-005**: Fix security misconfiguration vulnerability in `SecurityConfig.insecureFilterChain` by properly configuring security settings. Update the `insecureFilterChain` method to properly configure security settings, such as enabling CSRF protection and configuring authentication settings.
+
+6. **VULN-006**: Fix reflected XSS vulnerability in `UIController.greet` by properly escaping user input. Update the `greet` method to use `HtmlUtils.htmlEscape` to escape any user-controlled input before rendering it in the response.
+
+7. **VULN-007**: Fix software and data integrity failures vulnerability in `InsecureDeserializationController.deserialize` by properly handling deserialization. Update the `deserialize` method to use a secure deserialization mechanism, such as JSON deserialization, and ensure that the deserialized data is properly validated.
+
+## Next Steps
+
+1. Implement the remediation steps outlined above to fix the identified vulnerabilities.
+2. Conduct a thorough security review of the application to identify any additional vulnerabilities.
+3. Develop a comprehensive security testing plan to ensure that the application is properly secured.
 >>>>>>> Stashed changes
