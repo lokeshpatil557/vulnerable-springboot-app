@@ -2,6 +2,7 @@
 
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 1. **VULN-001**: Update `UserService.findByUsernameUnsafe` to use a parameterized query instead of string concatenation to prevent SQL injection. Ensure that the `username` parameter is properly sanitized and validated before being used in the query. Implement input validation to prevent malicious input from reaching the database.
 
 2. **VULN-002**: Update `CommentController.save` to use a prepared statement with parameterized queries to prevent SQL injection. Ensure that user input is properly sanitized and validated before being used in the query.
@@ -71,4 +72,25 @@
 1. **Implement secure coding practices**: Ensure that all developers are trained on secure coding practices and that code reviews are performed regularly to catch any security vulnerabilities.
 2. **Conduct regular security audits**: Perform regular security audits to identify and address any security vulnerabilities in the application.
 3. **Implement a bug bounty program**: Implement a bug bounty program to encourage responsible disclosure of security vulnerabilities and to reward researchers for their efforts.
+>>>>>>> Stashed changes
+=======
+1. **VULN-001**: Implement parameterized SQL queries in `UserService.findByUsernameUnsafe` to prevent SQL injection attacks. Update the method to use a `PreparedStatement` with a parameterized query, and ensure that user input is properly sanitized and validated. This will prevent attackers from injecting malicious SQL code and accessing sensitive data.
+
+2. **VULN-002**: Update `CommentController.save` to properly validate and sanitize user input to prevent XSS attacks. Use a whitelist approach to validate user input, and ensure that any user-controlled data is properly escaped or encoded before being rendered in the UI.
+
+3. **VULN-003**: Implement proper access controls in `TransferController.transfer` to prevent unauthorized access to sensitive data. Ensure that the method checks the user's role and permissions before allowing them to transfer funds, and implement additional security measures such as rate limiting and IP blocking to prevent abuse.
+
+4. **VULN-004**: Update `application.properties` to use secure cryptographic practices, such as using a secure password hashing algorithm and storing sensitive data securely. Ensure that all sensitive data is properly encrypted and protected, and implement additional security measures such as secure key management and secure data storage.
+
+5. **VULN-005**: Update `SecurityConfig.insecureFilterChain` to implement proper security configurations, such as enabling CSRF protection and implementing secure authentication and authorization mechanisms. Ensure that the method properly configures the security filter chain to prevent common web application vulnerabilities.
+
+6. **VULN-006**: Update `UIController.greet` to properly validate and sanitize user input to prevent XSS attacks. Use a whitelist approach to validate user input, and ensure that any user-controlled data is properly escaped or encoded before being rendered in the UI.
+
+7. **VULN-007**: Update `InsecureDeserializationController.deserialize` to implement proper deserialization practices, such as using a secure deserialization mechanism and validating user input. Ensure that the method properly deserializes user input and prevents common deserialization vulnerabilities.
+
+## Next Steps
+
+1. **Implement parameterized SQL queries**: Update all SQL queries to use parameterized queries to prevent SQL injection attacks.
+2. **Implement proper access controls**: Ensure that all sensitive data and functionality is properly protected with access controls, such as authentication and authorization mechanisms.
+3. **Implement secure cryptographic practices**: Update all cryptographic practices to use secure algorithms and protocols, such as secure password hashing and secure data storage.
 >>>>>>> Stashed changes

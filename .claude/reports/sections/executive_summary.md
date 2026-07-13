@@ -1,6 +1,7 @@
 # Executive Summary
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 ## Scope and Methodology
 This security assessment reviewed the entire Spring Boot codebase of the OWASP Top 10 (2021) Vulnerability Lab, focusing on the following check categories:
 - Injection
@@ -42,6 +43,13 @@ The assessment applied the following check categories:
 ## Risk Posture
 The OWASP Top 10 (2021) Vulnerability Lab is intentionally insecure and should not be deployed to any public server. The assessment identified several critical, high, medium, and low-risk vulnerabilities, indicating a high risk posture. The findings suggest that the application is vulnerable to various types of attacks, including injection, cross-site scripting, and authentication and authorization weaknesses.
 >>>>>>> Stashed changes
+=======
+## Scope and Methodology
+This security assessment reviewed the entire Spring Boot codebase, including all Java source files under `src/main/`, `pom.xml` for dependency and configuration risks, and `src/main/resources/application*.{yml,yaml,properties}` for misconfiguration. The assessment applied the following check categories: Injection, Cross-Site Scripting, Authentication, Authorization, Security Misconfiguration, Sensitive Data Exposure, Cryptographic Issues, Deserialization, File Handling, API Security, and Spring Security Specific.
+
+## Risk Posture
+The application exhibits a concerning risk posture, with multiple critical and high-severity findings that could be exploited by an attacker. The presence of hardcoded secrets, insecure deserialization, and broken authentication flows pose significant risks to the application's security. Additionally, the lack of proper authorization and authentication mechanisms could allow unauthorized access to sensitive data and functionality.
+>>>>>>> Stashed changes
 
 ## Finding Counts by Severity
 The assessment identified a total of 7 findings, categorized by severity as follows:
@@ -49,6 +57,7 @@ The assessment identified a total of 7 findings, categorized by severity as foll
 - High: 2
 - Medium: 2
 - Low: 2
+<<<<<<< Updated upstream
 <<<<<<< Updated upstream
 =======
 Total findings: 7
@@ -83,4 +92,7 @@ The OWASP Top 10 (2021) Vulnerability Lab is intentionally insecure, and this as
 * Medium: 3
 * Low: 14
 * Total findings: 20
+>>>>>>> Stashed changes
+=======
+These findings highlight the need for immediate attention and remediation to ensure the application's security and protect against potential attacks.
 >>>>>>> Stashed changes
