@@ -1,6 +1,10 @@
 # Risk Matrix
 
+<<<<<<< Updated upstream
 The risk matrix below is a table that maps the severity of the vulnerabilities found in the application to their likelihood of occurrence. The methodology used to create this matrix is based on the Common Weakness Enumeration (CWE) and the Open Web Application Security Project (OWASP) Top 10.
+=======
+The risk matrix below is a table that maps the severity of each vulnerability to its likelihood of occurrence. The methodology used to determine the severity and likelihood of each vulnerability is based on the OWASP Top 10 (2021) guidelines.
+>>>>>>> Stashed changes
 
 | Severity | Likelihood | Count |
 | --- | --- | --- |
@@ -8,12 +12,13 @@ The risk matrix below is a table that maps the severity of the vulnerabilities f
 | Critical | Medium | 0 |
 | Critical | Low | 0 |
 | High | High | 2 |
-| High | Medium | 0 |
+| High | Medium | 1 |
 | High | Low | 0 |
 | Medium | High | 1 |
-| Medium | Medium | 0 |
-| Medium | Low | 0 |
+| Medium | Medium | 2 |
+| Medium | Low | 1 |
 | Low | High | 0 |
+<<<<<<< Updated upstream
 <<<<<<< Updated upstream
 | Low | Medium | 2 |
 | Low | Low | 1 |
@@ -24,4 +29,10 @@ Note: The counts are based on the VULN-IDs provided, which are: VULN-001, VULN-0
 | Low | Low | 2 |
 
 Note: The counts are based on the provided VULN-IDs and may not reflect the actual risk posture of the application.
+>>>>>>> Stashed changes
+=======
+| Low | Medium | 5 |
+| Low | Low | 8 |
+
+Note: The counts are based on the provided VULN-IDs and do not include any additional findings.
 >>>>>>> Stashed changes

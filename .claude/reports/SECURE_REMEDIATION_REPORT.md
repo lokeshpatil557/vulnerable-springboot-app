@@ -1,3 +1,4 @@
+<<<<<<< Updated upstream
 # Remediation Summary
 ## Total Findings: 17
 ## Applied: 3
@@ -36,3 +37,29 @@ None
 
 
 > **Build verified: mvn compile test-compile passed** (recorded by the workflow after the agent emitted an empty patch set, or after patches applied cleanly).
+=======
+Build verified: mvn compile test-compile passed
+
+# Remediation Summary
+
+## Changes Made
+None — the agent emitted an empty `nvidia-patches` block.
+
+## Changes That Remained — Due To Build Breakage
+None
+
+## Files Referenced
+None
+
+## Vulnerability Remediations
+_No actionable remediations were generated. The original findings in SECURITY_ASSESSMENT_REPORT.md remain in the codebase._
+
+## Security Improvements
+None — no source changes were made.
+
+## Residual Risks
+All findings from SECURITY_ASSESSMENT_REPORT.md are still present in the codebase and require manual remediation.
+
+## Secure Coding Recommendations
+Refer to SECURITY_ASSESSMENT_REPORT.md and the OWASP Top 10 mapping for the recommended secure-by-default patterns.
+>>>>>>> Stashed changes

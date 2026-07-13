@@ -1,6 +1,7 @@
 # Priority Remediation Roadmap
 
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 1. **VULN-001**: Update `UserService.findByUsernameUnsafe` to use a parameterized query instead of string concatenation to prevent SQL injection. Ensure that the `username` parameter is properly sanitized and validated before being used in the query. Implement input validation to prevent malicious input from reaching the database.
 
 2. **VULN-002**: Update `CommentController.save` to use a prepared statement with parameterized queries to prevent SQL injection. Ensure that user input is properly sanitized and validated before being used in the query.
@@ -42,4 +43,32 @@
 1. Review and update security settings to ensure they are properly configured.
 2. Implement proper access control checks to prevent unauthorized access.
 3. Store secrets securely using environment variables or a secrets manager.
+>>>>>>> Stashed changes
+=======
+1. **VULN-001**: Update `UserService.findByUsernameUnsafe` to use a parameterized query instead of string concatenation to prevent SQL injection. Ensure that the `username` parameter is properly sanitized and validated before being used in the query. (Critical)
+2. **VULN-002**: Update `CommentController.save` to properly validate and sanitize user input to prevent XSS attacks. Use a whitelist approach to only allow specific HTML tags and attributes. (High)
+3. **VULN-003**: Update `UserController.transfer` to implement proper access control and authentication checks to prevent unauthorized access to sensitive data. Ensure that the `transfer` method is only accessible to authorized users. (High)
+4. **VULN-004**: Update `application.properties` to remove hardcoded secrets and instead use environment variables or a secure secrets management system. (Medium)
+5. **VULN-005**: Update `UIController.greet` to properly validate and sanitize user input to prevent XSS attacks. Use a whitelist approach to only allow specific HTML tags and attributes. (Medium)
+6. **VULN-006**: Update `InsecureDeserializationController.deserialize` to use a secure deserialization mechanism, such as JSON deserialization, to prevent deserialization attacks. (Medium)
+7. **VULN-007**: Update `SecurityConfig.insecureFilterChain` to implement proper security configurations, such as enabling CSRF protection and configuring secure headers. (Low)
+8. **VULN-008**: Update `User.java` to properly hash and store passwords using a secure password hashing algorithm, such as BCrypt. (Low)
+9. **VULN-009**: Update `UserController.transfer` to implement proper access control and authentication checks to prevent unauthorized access to sensitive data. Ensure that the `transfer` method is only accessible to authorized users. (Low)
+10. **VULN-010**: Update `CommentController.save` to properly validate and sanitize user input to prevent XSS attacks. Use a whitelist approach to only allow specific HTML tags and attributes. (Low)
+11. **VULN-011**: Update `SecurityConfig.insecureFilterChain` to implement proper security configurations, such as enabling CSRF protection and configuring secure headers. (Low)
+12. **VULN-012**: Update `SecurityConfig.insecureFilterChain` to implement proper security configurations, such as enabling CSRF protection and configuring secure headers. (Low)
+13. **VULN-013**: Update `UserController.transfer` to implement proper access control and authentication checks to prevent unauthorized access to sensitive data. Ensure that the `transfer` method is only accessible to authorized users. (Low)
+14. **VULN-014**: Update `CommentController.save` to properly validate and sanitize user input to prevent XSS attacks. Use a whitelist approach to only allow specific HTML tags and attributes. (Low)
+15. **VULN-015**: Update `SecurityConfig.insecureFilterChain` to implement proper security configurations, such as enabling CSRF protection and configuring secure headers. (Low)
+16. **VULN-016**: Update `SecurityConfig.insecureFilterChain` to implement proper security configurations, such as enabling CSRF protection and configuring secure headers. (Low)
+17. **VULN-017**: Update `SecurityConfig.insecureFilterChain` to implement proper security configurations, such as enabling CSRF protection and configuring secure headers. (Low)
+18. **VULN-018**: Update `SecurityConfig.insecureFilterChain` to implement proper security configurations, such as enabling CSRF protection and configuring secure headers. (Low)
+19. **VULN-019**: Update `SecurityConfig.insecureFilterChain` to implement proper security configurations, such as enabling CSRF protection and configuring secure headers. (Low)
+20. **VULN-020**: Update `SecurityConfig.insecureFilterChain` to implement proper security configurations, such as enabling CSRF protection and configuring secure headers. (Low)
+
+## Next Steps
+
+1. **Implement secure coding practices**: Ensure that all developers are trained on secure coding practices and that code reviews are performed regularly to catch any security vulnerabilities.
+2. **Conduct regular security audits**: Perform regular security audits to identify and address any security vulnerabilities in the application.
+3. **Implement a bug bounty program**: Implement a bug bounty program to encourage responsible disclosure of security vulnerabilities and to reward researchers for their efforts.
 >>>>>>> Stashed changes

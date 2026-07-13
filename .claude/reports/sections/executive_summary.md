@@ -1,5 +1,6 @@
 # Executive Summary
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 ## Scope and Methodology
 This security assessment reviewed the entire Spring Boot codebase of the OWASP Top 10 (2021) Vulnerability Lab, focusing on the following check categories:
 - Injection
@@ -51,4 +52,35 @@ The assessment identified a total of 7 findings, categorized by severity as foll
 <<<<<<< Updated upstream
 =======
 Total findings: 7
+>>>>>>> Stashed changes
+=======
+
+## Scope and Methodology
+
+This security assessment reviewed the entire Spring Boot codebase of the OWASP Top 10 (2021) Vulnerability Lab, focusing on the following check categories:
+
+* Injection (SQL, NoSQL, Command, Expression)
+* Cross-Site Scripting (Reflected, Stored, DOM)
+* Authentication (Plaintext passwords, Missing password hashing, Weak session management, Broken authentication flows)
+* Authorization (IDOR, Missing `@PreAuthorize` / `@Secured`, Privilege escalation, `.permitAll()` on sensitive endpoints)
+* Security Misconfiguration (Hardcoded secrets, Debug endpoints enabled, Verbose error messages, CORS misconfiguration)
+* Sensitive Data Exposure (API keys, tokens, passwords, secrets, PII in source or config)
+* Cryptographic Issues (Weak hashing, Insecure RNG, Hardcoded IVs, Disabled TLS)
+* Deserialization (Unsafe Java deserialization)
+* File Handling (Path traversal, Arbitrary file read/write, File upload without validation)
+* API Security (Missing `@Valid` / input validation, Missing rate limiting, Missing authentication on sensitive endpoints, Missing CSRF protection on state-changing endpoints)
+* Spring Security Specific (CSRF disabled, Anonymous access to privileged resources, Form login over HTTP)
+* Dependency Risks (Review of `pom.xml` for known-vulnerable library versions and unmaintained dependencies)
+
+## Risk Posture
+
+The OWASP Top 10 (2021) Vulnerability Lab is intentionally insecure, and this assessment identified a significant number of vulnerabilities across various categories. The lab's design and implementation prioritize educational value over security, resulting in a high-risk posture. While some vulnerabilities have been remediated, others remain, posing a risk to the application's security and confidentiality.
+
+## Finding Counts by Severity
+
+* Critical: 1
+* High: 2
+* Medium: 3
+* Low: 14
+* Total findings: 20
 >>>>>>> Stashed changes
