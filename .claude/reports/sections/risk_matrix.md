@@ -1,7 +1,5 @@
 # Risk Matrix
 
-The risk matrix is a table that maps the severity of a vulnerability to its likelihood of occurrence. The methodology used to create this matrix is based on the provided VULN-IDs, which are used to populate the counts for each combination of severity and likelihood.
-
 | Severity | Likelihood | Count |
 | --- | --- | --- |
 | Critical | High | 1 |
@@ -12,7 +10,9 @@ The risk matrix is a table that maps the severity of a vulnerability to its like
 | High | Low | 0 |
 | Medium | High | 1 |
 | Medium | Medium | 0 |
-| Medium | Low | 1 |
+| Medium | Low | 0 |
 | Low | High | 0 |
 | Low | Medium | 0 |
 | Low | Low | 1 |
+
+Methodology: This risk matrix is based on the provided VULN-IDs, which were analyzed to determine their severity and likelihood. The counts represent the number of vulnerabilities in each severity-likelihood combination.
