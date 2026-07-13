@@ -1423,6 +1423,14 @@ jobs:
 
           ---
 
+          ## CRITICAL OUTPUT RULES (must follow exactly)
+
+          1. Start with \`Build verified: mvn compile test-compile passed\` on the FIRST LINE of your reply (inside the fenced block, on the line just after \`\`\`markdown).
+          2. Do NOT include any merge conflict markers (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`, \`Updated upstream\`, \`Stashed changes\`). These will corrupt the report.
+          3. Do NOT echo, repeat, or 'merge with' any prior version of SECURE_REMEDIATION_REPORT.md. You have NO knowledge of any prior report — produce a fresh one.
+          4. Do NOT include any text outside the single fenced block. No preamble, no postamble, no apology.
+          5. Use the exact 8-section structure below. Do not add, remove, or rename sections.
+
           ## Required 8-section structure of SECURE_REMEDIATION_REPORT.md (mirror exactly)
 
           1. \`# Remediation Summary\` — total findings, Applied count, breakdown by severity, headline outcome. First line MUST be \`Build verified: mvn compile test-compile passed\`.
@@ -1447,7 +1455,7 @@ jobs:
           3. \`# Changes That Remained — Due To Build Breakage\`
           4. \`# Files Referenced\`
 
-          Do NOT emit sections 5-8. Do NOT emit the \`nvidia-patches\` block. Do NOT include any text outside the single fenced block." \
+          Do NOT emit sections 5-8. Do NOT emit the \`nvidia-patches\` block. Do NOT include any text outside the single fenced block. Do NOT include any merge conflict markers (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`). Produce a FRESH report, do not echo any prior content." \
               "$REM_MAX_TOKENS_REPORT_A" "remediate-report-a" '```markdown' "$MIN_REPORT_WORDS") || REPORT_PART_A=""
             if [ -z "$REPORT_PART_A" ]; then
               echo "::warning::[remediate] request 2 exhausted retries; patches ARE applied, writing placeholder report."
@@ -1479,7 +1487,7 @@ jobs:
           7. \`# Residual Risks\`
           8. \`# Secure Coding Recommendations\`
 
-          Do NOT emit sections 1-4. Do NOT emit the \`nvidia-patches\` block. Do NOT include any text outside the single fenced block." \
+          Do NOT emit sections 1-4. Do NOT emit the \`nvidia-patches\` block. Do NOT include any text outside the single fenced block. Do NOT include any merge conflict markers (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`). Produce a FRESH report, do not echo any prior content." \
               "$REM_MAX_TOKENS_REPORT_B" "remediate-report-b" '```markdown' "$MIN_REPORT_WORDS") || REPORT_PART_B=""
             if [ -z "$REPORT_PART_B" ]; then
               echo "::warning::[remediate] request 3 exhausted retries; patches ARE applied, writing placeholder report."
@@ -1492,6 +1500,9 @@ jobs:
             # 7b. Concatenate REPORT_PART_A + REPORT_PART_B into one
             #     report. Defensive: if the model re-emitted
             #     `# Remediation Summary` at the top of part B, drop it.
+            #     Also strip any git merge conflict markers the model
+            #     may have hallucinated — these would corrupt the
+            #     committed report and the push step.
             # ------------------------------------------------------------
             REPORT_PART_B=$(printf '%s\n' "$REPORT_PART_B" | awk '
               BEGIN { skipped_header = 0 }
@@ -1503,6 +1514,19 @@ jobs:
               printf '%s\n' "$REPORT_PART_A"
               printf '%s\n' "$REPORT_PART_B"
             } > "$REMEDIATION_REPORT"
+            # Defensive strip: drop any line that looks like a git
+            # conflict marker. The model sometimes emits these as
+            # boilerplate even when told not to. Belt-and-suspenders.
+            TMP_CLEAN=$(mktemp)
+            awk '
+              /^<<<<<<<[[:space:]]/        { print "<!-- (git conflict marker stripped) -->"; next }
+              /^=======[[:space:]]*$/      { print "<!-- (git conflict marker stripped) -->"; next }
+              /^>>>>>>>[[:space:]]/        { print "<!-- (git conflict marker stripped) -->"; next }
+              /^Updated upstream[[:space:]]*$/    { next }
+              /^Stashed changes[[:space:]]*$/     { next }
+              { print }
+            ' "$REMEDIATION_REPORT" > "$TMP_CLEAN"
+            mv "$TMP_CLEAN" "$REMEDIATION_REPORT"
             rm -f "$PATCH_SUMMARY"
             cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
             echo "Wrote $REMEDIATION_REPORT ($(wc -c < "$REMEDIATION_REPORT") bytes)."
