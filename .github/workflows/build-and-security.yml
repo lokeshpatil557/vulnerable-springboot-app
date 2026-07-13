@@ -740,7 +740,15 @@ jobs:
           # producing HTTP 504s on llama-3.1-70b, so we split the
           # remediation step into 3 smaller requests, each with its own
           # output budget sized to the job.
-          REM_MAX_TOKENS_PATCHES: "4000"
+          #   - Patches: needs headroom for whole-file replacements of
+          #     6-30 files. 4000 was too small and produced truncated
+          #     records (single trailing '}'). 10000 fits 6-15 files
+          #     comfortably and the upstream gateway still returns
+          #     within its timeout window.
+          #   - Report A (sections 1-4): short — counts + bullets.
+          #   - Report B (sections 5-8): per-finding narratives; the
+          #     heaviest section, biggest budget.
+          REM_MAX_TOKENS_PATCHES: "10000"
           REM_MAX_TOKENS_REPORT_A: "4000"
           REM_MAX_TOKENS_REPORT_B: "6000"
         run: |
@@ -1048,18 +1056,58 @@ jobs:
           #
           #   Requests 2 and 3 only run on the build-passed path.
           # ------------------------------------------------------------
-          PATCHES_PROMPT="$(cat "$USER_PAYLOAD")
+          PATCHES_PROMPT_BASE="$(cat "$USER_PAYLOAD")
 
           ---
 
           Emit ONLY the \`\`\`nvidia-patches fenced code block. The block must contain zero or more \`<repo-relative-path>@@@<full new file body>@@@\` records, separated by literal \`@@@\` lines on their own. Each body is the COMPLETE new file contents (first line to last line), ready to be written by \`cat > path <<'NVIDIA_PATCH_EOF' ... NVIDIA_PATCH_EOF\`. If a file needs no change, do not emit a record. If no findings are actionable, emit an empty block."
 
+          # Request 1 outer loop. The first attempt uses the standard
+          # prompt. If the parser finds zero valid patch records (i.e.
+          # the model truncated mid-record or emitted a malformed
+          # block), retry with a "concise mode" prompt that asks for
+          # minimal but complete file bodies — drop license headers,
+          # reduce comments to SPDX + class-level, keep method bodies
+          # only when they need to change. After two retries, give up
+          # and treat as parse failure (placeholder report).
           echo "=== NVIDIA REMEDIATE: Request 1/3 (patches) ==="
           PATCHES_RAW=""
-          PATCHES_RAW=$(call_with_retries "$PATCHES_PROMPT" "$REM_MAX_TOKENS_PATCHES" "remediate-patches" '```nvidia-patches' 0) || PATCHES_RAW=""
+          for req1_attempt in 1 2 3; do
+            if [ "$req1_attempt" = "1" ]; then
+              PATCHES_PROMPT="$PATCHES_PROMPT_BASE"
+            else
+              PATCHES_PROMPT="${PATCHES_PROMPT_BASE}
+
+          ---
+
+          NOTE: your previous attempt at this patches block was truncated or malformed (the workflow's parser found zero valid file records). Please retry in CONCISE MODE: drop license headers and most comments (keep only SPDX + class-level), keep only the methods that actually need to change, and make sure EVERY record ends with a closing \`@@@\`. If you cannot fit all files, emit only the first 2-3 records and end the block — a partial fix is better than a truncated one."
+            fi
+            echo "--- patches attempt $req1_attempt/3 ---"
+            PATCHES_RAW=$(call_with_retries "$PATCHES_PROMPT" "$REM_MAX_TOKENS_PATCHES" "remediate-patches" '```nvidia-patches' 0) || PATCHES_RAW=""
+
+            # If the API/validation layer failed entirely, no point
+            # retrying at this level — call_with_retries already
+            # exhausted its retries.
+            if [ -z "$PATCHES_RAW" ]; then
+              break
+            fi
+
+            # Quick parse preview: how many valid records did we get?
+            preview_count=$(printf '%s' "$PATCHES_RAW" | awk '
+              /^@@@[[:space:]]*$/ { sep++; next }
+              END { print int(sep/2) }
+            ')
+            if [ "${preview_count:-0}" -ge 1 ]; then
+              # At least one likely-valid record. Break out and let
+              # the full parser decide.
+              echo "[remediate-patches] preview: $preview_count candidate record(s) detected."
+              break
+            fi
+            echo "::warning::[remediate-patches] attempt $req1_attempt produced 0 candidate records; will retry with concise prompt."
+          done
           if [ -z "$PATCHES_RAW" ]; then
-            echo "::warning::[remediate] request 1 exhausted retries; writing placeholder report."
-            write_placeholder_report "not run — patches request could not be parsed after $MAX_REM_RETRIES attempts"
+            echo "::warning::[remediate] request 1 exhausted outer retries; writing placeholder report."
+            write_placeholder_report "not run — patches request could not be parsed after outer retries"
             cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
             BUILD_STATUS="parse_failed"
             exit 0
@@ -1174,6 +1222,21 @@ jobs:
 
           ATTEMPTED=$(wc -l < "$PATCHES_APPLIED_LOG" | tr -d ' ')
           echo "[remediate] $ATTEMPTED patch record(s) validated and queued for apply."
+
+          if [ "$ATTEMPTED" -eq 0 ] && [ "$bad_records" -gt 0 ]; then
+            # Model emitted SOMETHING that looked like patch records but
+            # none of them parsed to a real file path. This usually means
+            # the response was truncated mid-record (e.g. only the
+            # trailing '}' characters of a half-written file body are
+            # left). Treat as a parse failure — do NOT silently pass.
+            echo "::warning::[remediate] model emitted patch records but none parsed cleanly; treating as parse failure."
+            write_placeholder_report "failed — model emitted malformed patch records (likely truncated)"
+            cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+            BUILD_STATUS="parse_failed"
+            APPLIED=0
+            FILES_JSON="[]"
+            exit 0
+          fi
 
           if [ "$ATTEMPTED" -eq 0 ]; then
             # Empty patch block is a normal outcome per the agent's spec.
