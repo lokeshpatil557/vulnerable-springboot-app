@@ -1,22 +1,22 @@
-name: Build & Security (NVIDIA CI pipeline)
+name: Build & Security (claude CI pipeline)
 
 on:
   push:
     branches:
-      - nvdia_trials
+      - claude_trials
   pull_request:
     branches:
-      - nvdia_trials
+      - claude_trials
   workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
-  NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1/chat/completions
-  NVIDIA_MODEL: meta/llama-3.1-70b-instruct
-  NVIDIA_TEMPERATURE: "0.0"
-  NVIDIA_MAX_TOKENS: "12000"
+  claude_BASE_URL: https://integrate.api.claude.com/v1/chat/completions
+  claude_MODEL: meta/llama-3.1-70b-instruct
+  claude_TEMPERATURE: "0.0"
+  claude_MAX_TOKENS: "12000"
 
 jobs:
   build:
@@ -59,9 +59,9 @@ jobs:
       REMEDIATION_REPORT: .claude/reports/SECURE_REMEDIATION_REPORT.md
       PUSH_REPORT: .claude/reports/GIT_PUSH_REPORT.md
     outputs:
-      remediation_applied: ${{ steps.nvidia_remediate.outputs.applied }}
-      remediation_build_status: ${{ steps.nvidia_remediate.outputs.build_status }}
-      remediation_files: ${{ steps.nvidia_remediate.outputs.files }}
+      remediation_applied: ${{ steps.claude_remediate.outputs.applied }}
+      remediation_build_status: ${{ steps.claude_remediate.outputs.build_status }}
+      remediation_files: ${{ steps.claude_remediate.outputs.files }}
 
     steps:
       - name: Checkout
@@ -93,7 +93,7 @@ jobs:
           jq --version
 
       # -----------------------------------------------------------
-      # NVIDIA vulnerability scanner — six isolated API requests.
+      # claude vulnerability scanner — six isolated API requests.
       #
       #   Each request produces ONE section → saved to its own file:
       #     vulnerability_findings.md  (Request 1 — source of truth)
@@ -117,11 +117,11 @@ jobs:
       #     - unknown VULN-ID rejection (dependent sections)
       #     - dedupe pass on findings before save
       # -----------------------------------------------------------
-      - name: nvidia-scan
-        id: nvidia_scan
+      - name: claude-scan
+        id: claude_scan
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          SYSTEM_PROMPT_FILE: .claude/agents/nvidia-vulnerability-scanner.md
+          SYSTEM_PROMPT_FILE: .claude/agents/claude-vulnerability-scanner.md
           MAX_SECTION_RETRIES: "3"
           MAX_CONTINUATIONS: "3"
           MIN_SECTION_WORDS: "15"
@@ -199,9 +199,9 @@ jobs:
 
           SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
 
-          echo "=== NVIDIA SCAN: Preparing request ==="
+          echo "=== claude SCAN: Preparing request ==="
           echo "Payload size: $(wc -c < "$USER_PAYLOAD") bytes"
-          echo "Model: $NVIDIA_MODEL"
+          echo "Model: $claude_MODEL"
 
           # ------------------------------------------------------------
           # 2. Helper: strict fence extraction (preferred path).
@@ -276,15 +276,15 @@ jobs:
             return 1
           }
 
-          # call_nvidia never aborts the caller — on failure it sets
+          # call_claude never aborts the caller — on failure it sets
           # ASSISTANT="" and FINISH_REASON="error" and returns 1, so the
           # retry loop treats it exactly like a bad/empty response.
-          call_nvidia() {
+          call_claude() {
             local user_msg="$1" temp="$2"
             local REQUEST_BODY RESPONSE_FILE HTTP_CODE
             REQUEST_BODY=$(jq -n \
-              --arg model "$NVIDIA_MODEL" --arg sys "$SYSTEM_PROMPT" --arg user "$user_msg" \
-              --argjson temp "$temp" --argjson mtok "$NVIDIA_MAX_TOKENS" \
+              --arg model "$claude_MODEL" --arg sys "$SYSTEM_PROMPT" --arg user "$user_msg" \
+              --argjson temp "$temp" --argjson mtok "$claude_MAX_TOKENS" \
               '{model:$model, temperature:$temp, max_tokens:$mtok,
                 messages:[{role:"system",content:$sys},{role:"user",content:$user}]}')
             RESPONSE_FILE=$(mktemp)
@@ -292,9 +292,9 @@ jobs:
               -H "Authorization: Bearer $NVIDIA_API_KEY" -H "Content-Type: application/json" \
               --connect-timeout 60 --max-time 1200 \
               --retry 5 --retry-delay 15 --retry-all-errors --retry-max-time 900 \
-              -X POST "$NVIDIA_BASE_URL" -d "$REQUEST_BODY" || echo "000")
+              -X POST "$claude_BASE_URL" -d "$REQUEST_BODY" || echo "000")
             if [ "$HTTP_CODE" != "200" ]; then
-              echo "::warning::NVIDIA call HTTP $HTTP_CODE — will retry, not aborting."
+              echo "::warning::claude call HTTP $HTTP_CODE — will retry, not aborting."
               cat "$RESPONSE_FILE" || true
               rm -f "$RESPONSE_FILE"
               ASSISTANT=""
@@ -327,7 +327,7 @@ jobs:
           generate_section() {
             local section_id="$1" prompt_file="$2" report_file="$3" log_file="$4"
             local own_heading="$5" all_headings_csv="$6" extra_context="${7:-}"
-            local attempt=0 temp="$NVIDIA_TEMPERATURE" failure_note=""
+            local attempt=0 temp="$claude_TEMPERATURE" failure_note=""
             local best_block="" best_len=0
             SECTION_DEGRADED=0
 
@@ -362,7 +362,7 @@ jobs:
               local raw_accum="" sub=0 msg="$base_msg" call_failed=0
               while [ "$sub" -lt "$MAX_CONTINUATIONS" ]; do
                 sub=$((sub + 1))
-                if ! call_nvidia "$msg" "$temp"; then
+                if ! call_claude "$msg" "$temp"; then
                   call_failed=1
                   break
                 fi
@@ -643,8 +643,8 @@ jobs:
           {
             echo "# SECURITY ASSESSMENT REPORT"
             echo
-            echo "_Generated by the NVIDIA vulnerability scanner on $(date -u +%Y-%m-%dT%H:%M:%SZ)._"
-            echo "_Model: ${NVIDIA_MODEL} (build.nvidia.com)._"
+            echo "_Generated by the claude vulnerability scanner on $(date -u +%Y-%m-%dT%H:%M:%SZ)._"
+            echo "_Model: ${claude_MODEL} (build.claude.com)._"
             echo
             echo "## Contents"
             echo
@@ -679,7 +679,7 @@ jobs:
           if [ "$REPORT_BYTES" -lt 200 ]; then
             echo "::warning::Assessment report suspiciously small ($REPORT_BYTES bytes) — writing a placeholder note instead of failing the job."
             echo "" >> "$ASSESSMENT_REPORT"
-            echo "_Warning: the generated report was unexpectedly small. Check the nvidia-scan-transcript artifact for details._" >> "$ASSESSMENT_REPORT"
+            echo "_Warning: the generated report was unexpectedly small. Check the claude-scan-transcript artifact for details._" >> "$ASSESSMENT_REPORT"
           fi
           for expected_heading in \
             "# Executive Summary" "# Risk Matrix" "# Vulnerability Findings" \
@@ -690,29 +690,29 @@ jobs:
                 echo
                 echo "$expected_heading"
                 echo
-                echo "_This section could not be generated. See the nvidia-scan-transcript artifact for details._"
+                echo "_This section could not be generated. See the claude-scan-transcript artifact for details._"
               } >> "$ASSESSMENT_REPORT"
             fi
           done
 
-          cp "$SECTION_LOG" .claude/reports/nvidia-scan-transcript.log || true
+          cp "$SECTION_LOG" .claude/reports/claude-scan-transcript.log || true
           echo "Wrote $ASSESSMENT_REPORT ($REPORT_BYTES bytes). Job always completes — see warnings above for any degraded sections."
 
       # -----------------------------------------------------------
-      # NVIDIA remediation agent — ONE API request.
+      # claude remediation agent — ONE API request.
       #
       #   Reads SECURITY_ASSESSMENT_REPORT.md + the body of every file
-      #   the report references + pom.xml, POSTs once to the NVIDIA
+      #   the report references + pom.xml, POSTs once to the claude
       #   chat-completions endpoint, and expects TWO fenced blocks back:
       #
-      #     ```nvidia-patches     — <path>@@@<body>@@@<path>@@@<body>...
+      #     ```claude-patches     — <path>@@@<body>@@@<path>@@@<body>...
       #     ```markdown           — full contents of SECURE_REMEDIATION_REPORT.md
       #
       #   The workflow:
-      #     1. Parses the nvidia-patches block into <path, body> records.
+      #     1. Parses the claude-patches block into <path, body> records.
       #     2. Rejects unsafe paths (empty, absolute, contains '..', or
       #        not on disk).
-      #     3. Writes each file via `cat > path <<'NVIDIA_PATCH_EOF'`.
+      #     3. Writes each file via `cat > path <<'claude_PATCH_EOF'`.
       #     4. Runs `mvn -B -q compile test-compile` as the build gate.
       #     5. If the build breaks, `git checkout -- .` to revert the
       #        entire batch and rewrite the report's leading line to
@@ -728,11 +728,11 @@ jobs:
       #   as warnings and the push job continues with whatever the
       #   assessment report alone would have produced.
       # -----------------------------------------------------------
-      - name: nvidia-remediate
-        id: nvidia_remediate
+      - name: claude-remediate
+        id: claude_remediate
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          SYSTEM_PROMPT_FILE: .claude/agents/nvidia-remediation-agent.md
+          SYSTEM_PROMPT_FILE: .claude/agents/claude-remediation-agent.md
           MAX_REM_RETRIES: "3"
           MAX_CONTINUATIONS: "4"
           MIN_REPORT_WORDS: "20"
@@ -891,20 +891,20 @@ jobs:
 
           SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
 
-          echo "=== NVIDIA REMEDIATE: Preparing request ==="
+          echo "=== claude REMEDIATE: Preparing request ==="
           echo "Payload size: $(wc -c < "$USER_PAYLOAD") bytes"
-          echo "Model: $NVIDIA_MODEL"
+          echo "Model: $claude_MODEL"
 
           # ------------------------------------------------------------
-          # 2. call_nvidia — identical contract to the scan step, but
+          # 2. call_claude — identical contract to the scan step, but
           #    takes a per-call max_tokens override so the three
           #    remediation requests can use different output budgets.
           # ------------------------------------------------------------
-          call_nvidia() {
-            local user_msg="$1" temp="$2" mtok="${3:-$NVIDIA_MAX_TOKENS}"
+          call_claude() {
+            local user_msg="$1" temp="$2" mtok="${3:-$claude_MAX_TOKENS}"
             local REQUEST_BODY RESPONSE_FILE HTTP_CODE
             REQUEST_BODY=$(jq -n \
-              --arg model "$NVIDIA_MODEL" --arg sys "$SYSTEM_PROMPT" --arg user "$user_msg" \
+              --arg model "$claude_MODEL" --arg sys "$SYSTEM_PROMPT" --arg user "$user_msg" \
               --argjson temp "$temp" --argjson mtok "$mtok" \
               '{model:$model, temperature:$temp, max_tokens:$mtok,
                 messages:[{role:"system",content:$sys},{role:"user",content:$user}]}')
@@ -913,9 +913,9 @@ jobs:
               -H "Authorization: Bearer $NVIDIA_API_KEY" -H "Content-Type: application/json" \
               --connect-timeout 60 --max-time 1500 \
               --retry 5 --retry-delay 15 --retry-all-errors --retry-max-time 900 \
-              -X POST "$NVIDIA_BASE_URL" -d "$REQUEST_BODY" || echo "000")
+              -X POST "$claude_BASE_URL" -d "$REQUEST_BODY" || echo "000")
             if [ "$HTTP_CODE" != "200" ]; then
-              echo "::warning::NVIDIA call HTTP $HTTP_CODE — will retry, not aborting."
+              echo "::warning::claude call HTTP $HTTP_CODE — will retry, not aborting."
               cat "$RESPONSE_FILE" || true
               rm -f "$RESPONSE_FILE"
               ASSISTANT=""
@@ -933,7 +933,7 @@ jobs:
           #    we never drop a section entirely.
           # ------------------------------------------------------------
           extract_fence() {
-            # $1 = opening fence (e.g. '```nvidia-patches' or '```markdown')
+            # $1 = opening fence (e.g. '```claude-patches' or '```markdown')
             # $2 = raw text
             local open="$1" raw="$2"
             printf '%s' "$raw" | awk -v open="$open" '
@@ -958,7 +958,7 @@ jobs:
           # ------------------------------------------------------------
           call_with_retries() {
             local user_msg="$1" max_tokens="$2" label="$3" fence_open="$4" min_words="${5:-0}"
-            local attempt=0 temp="$NVIDIA_TEMPERATURE" failure_note=""
+            local attempt=0 temp="$claude_TEMPERATURE" failure_note=""
             local raw_accum=""
 
             while [ "$attempt" -lt "$MAX_REM_RETRIES" ]; do
@@ -977,7 +977,7 @@ jobs:
               local sub=0 msg="$base_msg" call_failed=0
               while [ "$sub" -lt "$MAX_CONTINUATIONS" ]; do
                 sub=$((sub + 1))
-                if ! call_nvidia "$msg" "$temp" "$max_tokens"; then
+                if ! call_claude "$msg" "$temp" "$max_tokens"; then
                   call_failed=1
                   break
                 fi
@@ -1060,7 +1060,7 @@ jobs:
 
           ---
 
-          Emit ONLY the \`\`\`nvidia-patches fenced code block. The block must contain zero or more \`<repo-relative-path>@@@<full new file body>@@@\` records, separated by literal \`@@@\` lines on their own. Each body is the COMPLETE new file contents (first line to last line), ready to be written by \`cat > path <<'NVIDIA_PATCH_EOF' ... NVIDIA_PATCH_EOF\`. If a file needs no change, do not emit a record. If no findings are actionable, emit an empty block."
+          Emit ONLY the \`\`\`claude-patches fenced code block. The block must contain zero or more \`<repo-relative-path>@@@<full new file body>@@@\` records, separated by literal \`@@@\` lines on their own. Each body is the COMPLETE new file contents (first line to last line), ready to be written by \`cat > path <<'claude_PATCH_EOF' ... claude_PATCH_EOF\`. If a file needs no change, do not emit a record. If no findings are actionable, emit an empty block."
 
           # Request 1 outer loop. The first attempt uses the standard
           # prompt. If the parser finds zero valid patch records (i.e.
@@ -1070,7 +1070,7 @@ jobs:
           # reduce comments to SPDX + class-level, keep method bodies
           # only when they need to change. After two retries, give up
           # and treat as parse failure (placeholder report).
-          echo "=== NVIDIA REMEDIATE: Request 1/3 (patches) ==="
+          echo "=== claude REMEDIATE: Request 1/3 (patches) ==="
           PATCHES_RAW=""
           for req1_attempt in 1 2 3; do
             if [ "$req1_attempt" = "1" ]; then
@@ -1083,7 +1083,7 @@ jobs:
           NOTE: your previous attempt at this patches block was truncated or malformed (the workflow's parser found zero valid file records). Please retry in CONCISE MODE: drop license headers and most comments (keep only SPDX + class-level), keep only the methods that actually need to change, and make sure EVERY record ends with a closing \`@@@\`. If you cannot fit all files, emit only the first 2-3 records and end the block — a partial fix is better than a truncated one."
             fi
             echo "--- patches attempt $req1_attempt/3 ---"
-            PATCHES_RAW=$(call_with_retries "$PATCHES_PROMPT" "$REM_MAX_TOKENS_PATCHES" "remediate-patches" '```nvidia-patches' 0) || PATCHES_RAW=""
+            PATCHES_RAW=$(call_with_retries "$PATCHES_PROMPT" "$REM_MAX_TOKENS_PATCHES" "remediate-patches" '```claude-patches' 0) || PATCHES_RAW=""
 
             # If the API/validation layer failed entirely, no point
             # retrying at this level — call_with_retries already
@@ -1108,7 +1108,7 @@ jobs:
           if [ -z "$PATCHES_RAW" ]; then
             echo "::warning::[remediate] request 1 exhausted outer retries; writing placeholder report."
             write_placeholder_report "not run — patches request could not be parsed after outer retries"
-            cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+            cp "$REM_LOG" .claude/reports/claude-remediate-transcript.log || true
             BUILD_STATUS="parse_failed"
             exit 0
           fi
@@ -1116,7 +1116,7 @@ jobs:
           # ------------------------------------------------------------
           # 5. Parse the patch block into <path, body> records.
           #
-          #   The agent's spec (nvidia-remediation-agent.md) emits each
+          #   The agent's spec (claude-remediation-agent.md) emits each
           #   record as:
           #
           #     <path>
@@ -1143,7 +1143,7 @@ jobs:
           echo "[" > "$FILES_JSON_TMP"
           first=1
 
-          # Strip any '```nvidia-patches' / '```' lines (defensive — strict
+          # Strip any '```claude-patches' / '```' lines (defensive — strict
           # extractor should already have removed them, but be safe).
           CLEAN=$(printf '%s' "$PATCHES_RAW" | grep -v '^```')
 
@@ -1231,7 +1231,7 @@ jobs:
             # left). Treat as a parse failure — do NOT silently pass.
             echo "::warning::[remediate] model emitted patch records but none parsed cleanly; treating as parse failure."
             write_placeholder_report "failed — model emitted malformed patch records (likely truncated)"
-            cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+            cp "$REM_LOG" .claude/reports/claude-remediate-transcript.log || true
             BUILD_STATUS="parse_failed"
             APPLIED=0
             FILES_JSON="[]"
@@ -1249,7 +1249,7 @@ jobs:
               echo "# Remediation Summary"
               echo
               echo "## Changes Made"
-              echo "None — the agent emitted an empty \`nvidia-patches\` block."
+              echo "None — the agent emitted an empty \`claude-patches\` block."
               echo
               echo "## Changes That Remained — Due To Build Breakage"
               echo "None"
@@ -1269,7 +1269,7 @@ jobs:
               echo "## Secure Coding Recommendations"
               echo "Refer to SECURITY_ASSESSMENT_REPORT.md and the OWASP Top 10 mapping for the recommended secure-by-default patterns."
             } > "$REMEDIATION_REPORT"
-            cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+            cp "$REM_LOG" .claude/reports/claude-remediate-transcript.log || true
             BUILD_STATUS="passed"
             APPLIED=0
             FILES_JSON="[]"
@@ -1417,7 +1417,7 @@ jobs:
 
           ## Patches already applied (do NOT re-emit code in your reply; the file bodies are on disk)
 
-          The following source files have ALREADY been patched on disk by the workflow. Do not produce a \`nvidia-patches\` block; do not re-emit file bodies. Just describe what was changed, one bullet per file. The patches compile cleanly (mvn compile test-compile passed).
+          The following source files have ALREADY been patched on disk by the workflow. Do not produce a \`claude-patches\` block; do not re-emit file bodies. Just describe what was changed, one bullet per file. The patches compile cleanly (mvn compile test-compile passed).
 
           $(cat "$PATCH_SUMMARY")
 
@@ -1442,7 +1442,7 @@ jobs:
           7. \`# Residual Risks\` — Skipped findings, dependency upgrades, password migrations.
           8. \`# Secure Coding Recommendations\` — durable guardrails."
 
-            echo "=== NVIDIA REMEDIATE: Request 2/3 (report sections 1-4) ==="
+            echo "=== claude REMEDIATE: Request 2/3 (report sections 1-4) ==="
             REPORT_PART_A=""
             REPORT_PART_A=$(call_with_retries "${REPORT_PROMPT}
 
@@ -1455,12 +1455,12 @@ jobs:
           3. \`# Changes That Remained — Due To Build Breakage\`
           4. \`# Files Referenced\`
 
-          Do NOT emit sections 5-8. Do NOT emit the \`nvidia-patches\` block. Do NOT include any text outside the single fenced block. Do NOT include any merge conflict markers (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`). Produce a FRESH report, do not echo any prior content." \
+          Do NOT emit sections 5-8. Do NOT emit the \`claude-patches\` block. Do NOT include any text outside the single fenced block. Do NOT include any merge conflict markers (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`). Produce a FRESH report, do not echo any prior content." \
               "$REM_MAX_TOKENS_REPORT_A" "remediate-report-a" '```markdown' "$MIN_REPORT_WORDS") || REPORT_PART_A=""
             if [ -z "$REPORT_PART_A" ]; then
               echo "::warning::[remediate] request 2 exhausted retries; patches ARE applied, writing placeholder report."
               write_placeholder_report "mvn compile test-compile passed (patches applied) — report part A could not be parsed after $MAX_REM_RETRIES attempts"
-              cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+              cp "$REM_LOG" .claude/reports/claude-remediate-transcript.log || true
               exit 0
             fi
 
@@ -1468,7 +1468,7 @@ jobs:
             # not duplicate the leading line.
             PART_A_TAIL=$(printf '%s' "$REPORT_PART_A" | tail -c 800)
 
-            echo "=== NVIDIA REMEDIATE: Request 3/3 (report sections 5-8) ==="
+            echo "=== claude REMEDIATE: Request 3/3 (report sections 5-8) ==="
             REPORT_PART_B=""
             REPORT_PART_B=$(call_with_retries "${REPORT_PROMPT}
 
@@ -1487,12 +1487,12 @@ jobs:
           7. \`# Residual Risks\`
           8. \`# Secure Coding Recommendations\`
 
-          Do NOT emit sections 1-4. Do NOT emit the \`nvidia-patches\` block. Do NOT include any text outside the single fenced block. Do NOT include any merge conflict markers (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`). Produce a FRESH report, do not echo any prior content." \
+          Do NOT emit sections 1-4. Do NOT emit the \`claude-patches\` block. Do NOT include any text outside the single fenced block. Do NOT include any merge conflict markers (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`). Produce a FRESH report, do not echo any prior content." \
               "$REM_MAX_TOKENS_REPORT_B" "remediate-report-b" '```markdown' "$MIN_REPORT_WORDS") || REPORT_PART_B=""
             if [ -z "$REPORT_PART_B" ]; then
               echo "::warning::[remediate] request 3 exhausted retries; patches ARE applied, writing placeholder report."
               write_placeholder_report "mvn compile test-compile passed (patches applied) — report part B could not be parsed after $MAX_REM_RETRIES attempts"
-              cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+              cp "$REM_LOG" .claude/reports/claude-remediate-transcript.log || true
               exit 0
             fi
 
@@ -1528,7 +1528,7 @@ jobs:
             ' "$REMEDIATION_REPORT" > "$TMP_CLEAN"
             mv "$TMP_CLEAN" "$REMEDIATION_REPORT"
             rm -f "$PATCH_SUMMARY"
-            cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+            cp "$REM_LOG" .claude/reports/claude-remediate-transcript.log || true
             echo "Wrote $REMEDIATION_REPORT ($(wc -c < "$REMEDIATION_REPORT") bytes)."
           else
             echo "::warning::[remediate] build gate FAILED — reverting all patches."
@@ -1536,18 +1536,18 @@ jobs:
             # No API calls on the failure path — write the report locally
             # with the standard "failed — all edits reverted" leading line.
             write_placeholder_report "failed — all edits reverted"
-            cp "$REM_LOG" .claude/reports/nvidia-remediate-transcript.log || true
+            cp "$REM_LOG" .claude/reports/claude-remediate-transcript.log || true
             BUILD_STATUS="reverted"
             APPLIED=0
             FILES_JSON="[]"
           fi
 
-      - name: Upload nvidia-scan transcript
-        if: always() && hashFiles('.claude/reports/nvidia-scan-transcript.log') != ''
+      - name: Upload claude-scan transcript
+        if: always() && hashFiles('.claude/reports/claude-scan-transcript.log') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: nvidia-scan-transcript
-          path: .claude/reports/nvidia-scan-transcript.log
+          name: claude-scan-transcript
+          path: .claude/reports/claude-scan-transcript.log
           retention-days: 30
 
       - name: Upload section files
@@ -1566,12 +1566,12 @@ jobs:
           path: ${{ env.ASSESSMENT_REPORT }}
           retention-days: 90
 
-      - name: Upload nvidia-remediate transcript
-        if: always() && hashFiles('.claude/reports/nvidia-remediate-transcript.log') != ''
+      - name: Upload claude-remediate transcript
+        if: always() && hashFiles('.claude/reports/claude-remediate-transcript.log') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: nvidia-remediate-transcript
-          path: .claude/reports/nvidia-remediate-transcript.log
+          name: claude-remediate-transcript
+          path: .claude/reports/claude-remediate-transcript.log
           retention-days: 30
 
       - name: Upload secure remediation report
@@ -1593,14 +1593,14 @@ jobs:
           echo "---"
           git diff --cached --stat | tail -n 20
 
-      - name: nvidia-push
-        id: nvidia_push
+      - name: claude-push
+        id: claude_push
         env:
-          CHAIN_PREFIX: nvdia_trials
-          DEVELOPMENT_BRANCH: nvdia_trials
-          REMEDIATION_APPLIED: ${{ steps.nvidia_remediate.outputs.applied }}
-          REMEDIATION_BUILD_STATUS: ${{ steps.nvidia_remediate.outputs.build_status }}
-          REMEDIATION_FILES_JSON: ${{ steps.nvidia_remediate.outputs.files }}
+          CHAIN_PREFIX: claude_trials
+          DEVELOPMENT_BRANCH: claude_trials
+          REMEDIATION_APPLIED: ${{ steps.claude_remediate.outputs.applied }}
+          REMEDIATION_BUILD_STATUS: ${{ steps.claude_remediate.outputs.build_status }}
+          REMEDIATION_FILES_JSON: ${{ steps.claude_remediate.outputs.files }}
         run: |
           set -euo pipefail
 
@@ -1684,13 +1684,13 @@ jobs:
           # step so reviewers know whether this branch carries code changes.
           if [ "${APPLIED_COUNT:-0}" -gt 0 ]; then
             SOURCE_LINE="Source: SECURITY_ASSESSMENT_REPORT.md + SECURE_REMEDIATION_REPORT.md (Applied: ${APPLIED_COUNT} patch(es) over ${REMEDIATION_FILES_COUNT} file(s) — Build verified: mvn compile test-compile passed)"
-            SUBJECT="NVIDIA git-agent push #${NEW_N} — automated remediation"
+            SUBJECT="claude git-agent push #${NEW_N} — automated remediation"
           else
             SOURCE_LINE="Source: SECURITY_ASSESSMENT_REPORT.md (no code changes — remediation step reported: ${BUILD_STATUS_REM})"
-            SUBJECT="NVIDIA git-agent push #${NEW_N} — security scan report"
+            SUBJECT="claude git-agent push #${NEW_N} — security scan report"
           fi
           if [ "${#SUBJECT}" -gt 72 ]; then
-            SUBJECT="NVIDIA git-agent push #${NEW_N} — scan report"
+            SUBJECT="claude git-agent push #${NEW_N} — scan report"
           fi
 
           COMMIT_MSG=$(printf '%s\n\n%s\n\n%s\n%s\n%s\n\n%s\n' \
@@ -1750,7 +1750,7 @@ jobs:
           fi
 
           {
-            echo "# Git Push Report — NVIDIA git-agent Push #${NEW_N}"
+            echo "# Git Push Report — claude git-agent Push #${NEW_N}"
             echo
             echo "- **Development branch:** \`${DEVELOPMENT_BRANCH}\`"
             echo "- **Parent branch:** \`${PARENT}\`"
@@ -1808,7 +1808,7 @@ jobs:
           fi
 
           case "$TRIGGER_BRANCH" in
-            nvdia_trials_[0-9]*_*)
+            claude_trials_[0-9]*_*)
               echo "::error::Refusing to push report updates to a chain step branch: $TRIGGER_BRANCH"
               exit 1
               ;;

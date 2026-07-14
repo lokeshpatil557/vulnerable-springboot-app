@@ -42,19 +42,19 @@ USER_PAYLOAD=$(mktemp)
 } > "$USER_PAYLOAD"
 
 echo "=================================="
-echo "NVIDIA REMEDIATE: Preparing request"
+echo "claude REMEDIATE: Preparing request"
 echo "Assessment report size: $(wc -c < "$ASSESSMENT_REPORT") bytes"
 echo "Payload size: $(wc -c < "$USER_PAYLOAD") bytes"
-echo "Model: $NVIDIA_MODEL"
-echo "Endpoint: $NVIDIA_BASE_URL"
+echo "Model: $claude_MODEL"
+echo "Endpoint: $claude_BASE_URL"
 echo "=================================="
 
 REQUEST_BODY=$(jq -n \
-  --arg model  "$NVIDIA_MODEL" \
+  --arg model  "$claude_MODEL" \
   --arg sys    "$SYSTEM_PROMPT" \
   --arg user   "$(cat "$USER_PAYLOAD")" \
-  --argjson temp  "$NVIDIA_TEMPERATURE" \
-  --argjson mtok "$NVIDIA_MAX_TOKENS" \
+  --argjson temp  "$claude_TEMPERATURE" \
+  --argjson mtok "$claude_MAX_TOKENS" \
   '{model: $model, temperature: $temp, max_tokens: $mtok,
     messages: [
       {role: "system", content: $sys},
@@ -62,21 +62,21 @@ REQUEST_BODY=$(jq -n \
     ]}')
 
 echo "Request body size: $(echo "$REQUEST_BODY" | wc -c) bytes"
-echo "=== NVIDIA REMEDIATE: Calling API ==="
+echo "=== claude REMEDIATE: Calling API ==="
 
 RESPONSE_FILE=$(mktemp)
 HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" \
   -H "Authorization: Bearer $NVIDIA_API_KEY" \
   -H "Content-Type: application/json" \
   --max-time 600 \
-  -X POST "$NVIDIA_BASE_URL" \
+  -X POST "$claude_BASE_URL" \
   -d "$REQUEST_BODY" || echo "000")
 
 echo "HTTP Response Code: $HTTP_CODE"
 
 if [ "$HTTP_CODE" != "200" ]; then
-  echo "::error::NVIDIA remediate HTTP $HTTP_CODE (expected 200)"
-  echo "=== NVIDIA API Response ==="
+  echo "::error::claude remediate HTTP $HTTP_CODE (expected 200)"
+  echo "=== claude API Response ==="
   cat "$RESPONSE_FILE" || true
   echo "=== End Response ==="
   exit 1
@@ -84,7 +84,7 @@ fi
 
 ASSISTANT=$(jq -r '.choices[0].message.content // ""' "$RESPONSE_FILE")
 if [ -z "$ASSISTANT" ]; then
-  echo "::error::NVIDIA remediate returned empty assistant content."
+  echo "::error::claude remediate returned empty assistant content."
   echo "=== Full Response ==="
   cat "$RESPONSE_FILE" || true
   echo "=== End Response ==="
@@ -93,10 +93,10 @@ fi
 
 echo "✓ Assistant response received: $(echo "$ASSISTANT" | wc -c) bytes"
 
-# Block 1: ```nvidia-patches ... ```
+# Block 1: ```claude-patches ... ```
 PATCHES=$(printf '%s\n' "$ASSISTANT" \
   | awk '
-      /^```nvidia-patches/{ if (!in_block) {in_block=1; next} else {in_block=0; exit} }
+      /^```claude-patches/{ if (!in_block) {in_block=1; next} else {in_block=0; exit} }
       /^```/{ if (!in_block) next }
       in_block {print}
     ')
@@ -219,5 +219,5 @@ if [ -n "$PATCHES" ]; then
   
   echo "Applied $APPLIED file(s)."
 else
-  echo "ℹ No patches emitted by NVIDIA (empty patch block)."
+  echo "ℹ No patches emitted by claude (empty patch block)."
 fi
