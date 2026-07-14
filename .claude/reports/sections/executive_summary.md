@@ -2,6 +2,7 @@
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 ## Scope and Methodology
 This security assessment reviewed the entire Spring Boot codebase of the OWASP Top 10 (2021) Vulnerability Lab, focusing on the following check categories:
 - Injection
@@ -99,4 +100,18 @@ These findings highlight the need for immediate attention and remediation to ens
 >>>>>>> Stashed changes
 =======
 Total findings: 7
+>>>>>>> Stashed changes
+=======
+## Scope and Methodology
+This security assessment reviewed the entire Spring Boot codebase, including all Java source files under `src/main/`, `pom.xml` for dependency and configuration risks, and `src/main/resources/application*.{yml,yaml,properties}` for misconfiguration. The assessment applied the following check categories: Injection, Cross-Site Scripting, Authentication, Authorization, Security Misconfiguration, Sensitive Data Exposure, Cryptographic Issues, Deserialization, File Handling, API Security, and Spring Security Specific.
+
+## Risk Posture
+The application exhibits a concerning risk posture, with multiple critical and high-severity findings that could be exploited by an attacker. The presence of hardcoded secrets, plaintext passwords, and insecure deserialization practices increases the likelihood of a successful attack. Furthermore, the lack of proper authentication and authorization mechanisms, combined with the absence of input validation and rate limiting, makes the application vulnerable to various types of attacks.
+
+## Finding Counts by Severity
+The assessment identified a total of 10 findings, categorized by severity as follows:
+- Critical: 1
+- High: 2
+- Medium: 3
+- Low: 4
 >>>>>>> Stashed changes

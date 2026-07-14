@@ -5,6 +5,7 @@
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 =======
 >>>>>>> Stashed changes
 | CWE-79 | Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting') | VULN-002, VULN-006 |
@@ -35,6 +36,14 @@
 | CWE-284 | Improper Access Control | VULN-003 |
 | CWE-352 | Cross-Site Request Forgery (CSRF) |  |
 | CWE-502 | Deserialization of Untrusted Data | VULN-007 |
+>>>>>>> Stashed changes
+=======
+| CWE-79 | Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting') | VULN-002, VULN-007 |
+| CWE-89 | SQL Injection | VULN-001, VULN-008 |
+| CWE-284 | Improper Access Control | VULN-003, VULN-009, VULN-010 |
+| CWE-352 | Cross-Site Request Forgery (CSRF) |  |
+| CWE-502 | Deserialization of Untrusted Data | VULN-006 |
+| CWE-639 | Authorization Bypass Through User-Controlled Key |  |
 >>>>>>> Stashed changes
 | CWE-798 | Use of Hard-coded Credentials | VULN-004 |
 | CWE-916 | Use of Password Hash With Insufficient Computational Effort | VULN-008 |

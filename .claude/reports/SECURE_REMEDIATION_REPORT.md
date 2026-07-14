@@ -2,6 +2,7 @@
 # Remediation Summary
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 ## Total Findings: 17
 ## Applied: 3
 ## Skipped — due to this breaking: 0
@@ -64,6 +65,42 @@ All findings from SECURITY_ASSESSMENT_REPORT.md are still present in the codebas
 
 ## Secure Coding Recommendations
 Refer to SECURITY_ASSESSMENT_REPORT.md and the OWASP Top 10 mapping for the recommended secure-by-default patterns.
+>>>>>>> Stashed changes
+=======
+
+Build verified: failed — model emitted malformed patch records (likely truncated)
+
+## Total Findings by Severity
+| Severity | Number of Findings |
+| --- | --- |
+| Critical | 0 |
+| High | 0 |
+| Medium | 0 |
+| Low | 0 |
+
+## Build Verified
+Build verified: failed — model emitted malformed patch records (likely truncated)
+
+## Changes Made
+None
+
+## Changes That Remained — Due To Build Breakage
+None
+
+## Files Referenced
+None
+
+## Vulnerability Remediations
+_No remediations were generated._
+
+## Security Improvements
+_Not generated — see Build Verified line above._
+
+## Residual Risks
+_Not generated — see Build Verified line above._
+
+## Secure Coding Recommendations
+_Not generated — see Build Verified line above._
 >>>>>>> Stashed changes
 =======
 

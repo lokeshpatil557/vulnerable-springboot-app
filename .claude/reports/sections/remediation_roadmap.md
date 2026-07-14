@@ -4,6 +4,7 @@
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 1. **VULN-001**: Update `UserService.findByUsernameUnsafe` to use a parameterized query instead of string concatenation to prevent SQL injection. Ensure that the `username` parameter is properly sanitized and validated before being used in the query. Implement input validation to prevent malicious input from reaching the database.
 
 2. **VULN-002**: Update `CommentController.save` to use a prepared statement with parameterized queries to prevent SQL injection. Ensure that user input is properly sanitized and validated before being used in the query.
@@ -115,4 +116,22 @@
 1. Implement the remediation steps outlined above to fix the identified vulnerabilities.
 2. Conduct a thorough security review of the application to identify any additional vulnerabilities.
 3. Develop a comprehensive security testing plan to ensure that the application is properly secured.
+>>>>>>> Stashed changes
+=======
+1. **VULN-001**: Implement prepared statements or parameterized queries to prevent SQL injection attacks. Update the `findByUsernameUnsafe` method in `UserService.java` to use a parameterized query.
+2. **VULN-002**: Validate and sanitize user input to prevent XSS attacks. Update the `save` method in `CommentController.java` to use a whitelist approach for allowed HTML tags and attributes.
+3. **VULN-003**: Implement access controls to prevent unauthorized access to sensitive data. Update the `transfer` method in `TransferController.java` to check for user ownership and permissions before allowing transfers.
+4. **VULN-004**: Store sensitive data securely using a secrets manager. Update the `apiKey` method in `SecretConfig.java` to retrieve the API key from a secure storage solution.
+5. **VULN-005**: Configure security settings to prevent common web attacks. Update the `insecureFilterChain` method in `SecurityConfig.java` to enable CSRF protection and configure security headers.
+6. **VULN-006**: Implement secure deserialization practices to prevent deserialization attacks. Update the `deserialize` method in `InsecureDeserializationController.java` to use a secure deserialization library.
+7. **VULN-007**: Validate and sanitize user input to prevent XSS attacks. Update the `greet` method in `CommentController.java` to use a whitelist approach for allowed HTML tags and attributes.
+8. **VULN-008**: Implement prepared statements or parameterized queries to prevent SQL injection attacks. Update the `search` method in `UserService.java` to use a parameterized query.
+9. **VULN-009**: Implement access controls to prevent unauthorized access to sensitive data. Update the `listUsers` method in `UserController.java` to check for user permissions before allowing access to user data.
+10. **VULN-010**: Implement access controls to prevent unauthorized access to sensitive data. Update the `getProfile` method in `UserController.java` to check for user ownership and permissions before allowing access to user profiles.
+
+## Next Steps
+
+1. **Implement a Web Application Firewall (WAF)**: Configure a WAF to detect and prevent common web attacks, such as SQL injection and XSS.
+2. **Conduct Regular Security Audits**: Perform regular security audits to identify and address potential security vulnerabilities.
+3. **Implement a Secure Development Lifecycle**: Establish a secure development lifecycle to ensure that security is integrated into every stage of the development process.
 >>>>>>> Stashed changes
