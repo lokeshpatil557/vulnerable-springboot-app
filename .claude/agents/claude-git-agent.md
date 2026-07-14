@@ -87,11 +87,11 @@ It does **not** fire on pushes to `feature/safe-backup_*`, `feature/claude-git-a
 
 ## Why the model is not in this step
 
-Originally the claude model was asked to compute the next chain step and emit a JSON line. That had two failure modes: (a) the model could emit a non-conforming branch name, and (b) the JSON parsing could fail and lose the push entirely. The workflow now does the computation locally and acts as the only writer, so a model error in this step is impossible.
+Originally the NVIDIA-hosted model was asked to compute the next chain step and emit a JSON line. That had two failure modes: (a) the model could emit a non-conforming branch name, and (b) the JSON parsing could fail and lose the push entirely. The workflow now does the computation locally and acts as the only writer, so a model error in this step is impossible.
 
 ## What is unchanged from the old agent
 
-- The scan (`claude-scan`) and remediation (`claude-remediate`) jobs **still** call claude via `integrate.api.claude.com`. They are read-only / patch-emitting — they never push.
+- The scan (`claude-scan`) and remediation (`claude-remediate`) jobs **still** call NVIDIA via `integrate.api.nvidia.com`. They are read-only / patch-emitting — they never push.
 - The `claude-vulnerability-scanner.md` and `claude-remediation-agent.md` specs are unchanged.
 
 ## What is new vs. the old agent
